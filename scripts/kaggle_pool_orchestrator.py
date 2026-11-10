@@ -151,7 +151,7 @@ def push_all_shards(args: argparse.Namespace, accounts: List[Tuple[str, str]]) -
             if args.ablation_sweep
             else args.variant
         )
-        slug = f"tscope-vcm-shard-{shard_id:02d}"
+        slug = f"t-scope-vcm-shard-{shard_id:02d}"
         kernel_id = f"{user}/{slug}"
 
         try:
@@ -204,7 +204,7 @@ def check_status_all(args: argparse.Namespace, accounts: List[Tuple[str, str]]) 
     print(f"Checking kernel status across {max_idx} accounts...")
     for shard_id in range(max_idx):
         user, token = accounts[shard_id]
-        kernel_id = f"{user}/tscope-vcm-shard-{shard_id:02d}"
+        kernel_id = f"{user}/t-scope-vcm-shard-{shard_id:02d}"
         try:
             api = get_authenticated_api(user, token)
             st = api.kernels_status(kernel_id)
@@ -225,7 +225,7 @@ def pull_and_merge_all(args: argparse.Namespace, accounts: List[Tuple[str, str]]
     pulled = 0
     for shard_id in range(max_idx):
         user, token = accounts[shard_id]
-        kernel_id = f"{user}/tscope-vcm-shard-{shard_id:02d}"
+        kernel_id = f"{user}/t-scope-vcm-shard-{shard_id:02d}"
         try:
             api = get_authenticated_api(user, token)
             api.kernels_output(kernel_id, path=str(out_dir), quiet=True)
