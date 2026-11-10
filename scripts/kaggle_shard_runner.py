@@ -23,7 +23,7 @@ from models.temporal_scope import TemporalSCOPE, gaussian_blur_5x5
 from models.frozen_detector_fpn import FrozenFPNDetectorTeacher
 from video_codecs.hybrid_x265_ste import HybridX265STE
 from losses.vcm_temporal_loss import VCMTemporalPreEditLoss
-from datasets.vcm_video_datasets import RealVCMVideoDataset
+from vcm_datasets.vcm_video_datasets import RealVCMVideoDataset
 from scripts.prepare_kaggle_datasets import find_mounted_kaggle_dataset
 
 
@@ -242,11 +242,7 @@ def run_train_shard(args: argparse.Namespace) -> None:
         qg_size=16,
         max_delta_qp=preset_cfg["max_delta_qp"],
     ).to(device)
-
-    # Leverage both T4 GPUs on Kaggle (T4 x2) automatically via DataParallel
-    model: nn.Module = (
-        nn.DataParallel(base_model) if n_gpus > 1 else base_model
-    )
+    model: nn.Module = base_model
 
     codec_ste = HybridX265STE(
         use_real_x265_in_forward=preset_cfg["use_real_x265_ste"] and args.enable_x265_ste

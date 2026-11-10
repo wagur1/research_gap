@@ -76,14 +76,16 @@ BATCH_SIZE = {batch_size}
 IMG_SIZE = {img_size}
 RUN_MODE = "{run_mode}"
 
-repo_dir = Path("/kaggle/working/research_gap")
-if not repo_dir.exists():
-    subprocess.run(
-        ["git", "clone", "https://github.com/wagur1/research_gap.git", str(repo_dir)],
-        check=True,
-    )
-else:
-    subprocess.run(["git", "-C", str(repo_dir), "pull"], check=True)
+repo_dir = Path("/tmp/research_gap")
+if repo_dir.exists():
+    subprocess.run(["rm", "-rf", str(repo_dir)], check=False)
+subprocess.run(
+    ["git", "clone", "https://github.com/wagur1/research_gap.git", str(repo_dir)],
+    check=True,
+)
+
+env = os.environ.copy()
+env["PYTHONPATH"] = str(repo_dir) + os.pathsep + env.get("PYTHONPATH", "")
 
 if RUN_MODE in ("eval_poc", "both"):
     cmd_eval = [
@@ -96,7 +98,7 @@ if RUN_MODE in ("eval_poc", "both"):
         "--use_pretrained_fpn",
         "--output_dir", "/kaggle/working",
     ]
-    subprocess.run(cmd_eval, check=True)
+    subprocess.run(cmd_eval, cwd=str(repo_dir), env=env, check=True)
 
 if RUN_MODE in ("train", "both"):
     cmd_train = [
@@ -113,10 +115,8 @@ if RUN_MODE in ("train", "both"):
         "--use_pretrained_fpn",
         "--output_dir", "/kaggle/working",
     ]
-    subprocess.run(cmd_train, check=True)
+    subprocess.run(cmd_train, cwd=str(repo_dir), env=env, check=True)
 
-# Clean cloned repo folder before kernel finishes so /kaggle/working only keeps .json and .pt outputs
-subprocess.run(["rm", "-rf", str(repo_dir)], check=False)
 print(f"=== Shard {{SHARD_ID}}/{{NUM_SHARDS}} ({{VARIANT}}) finished successfully! ===")
 '''
 
@@ -189,10 +189,11 @@ def push_all_shards(args: argparse.Namespace, accounts: List[Tuple[str, str]]) -
                 )
 
                 res = api.kernels_push(str(tmp_path))
-                ref_url = getattr(res, "url", kernel_id)
+                ref_url = getattr(res, "url", "") or ""
+                err_msg = getattr(res, "error", "") or ""
                 print(
                     f"  [Shard {shard_id:02d}/{num_shards:02d}] Pushed -> {kernel_id:<38} "
-                    f"| variant={variant:<18} | {ref_url}"
+                    f"| variant={variant:<18} | {ref_url} {err_msg}"
                 )
         except Exception as e:
             print(f"  [Shard {shard_id:02d}/{num_shards:02d}] ERROR on {user}: {e}")
