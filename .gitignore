@@ -4,6 +4,7 @@ __pycache__/
 .venv/
 venv/
 outputs/
+data/
 *.pt
 *.pth
 *.hevc

@@ -22,6 +22,8 @@ if str(ROOT_DIR) not in sys.path:
 from models.temporal_scope import TemporalSCOPE, gaussian_blur_5x5
 from video_codecs.hybrid_x265_ste import HybridX265STE
 from losses.vcm_temporal_loss import VCMTemporalPreEditLoss
+from datasets.vcm_video_datasets import RealVCMVideoDataset
+from scripts.prepare_kaggle_datasets import find_mounted_kaggle_dataset
 
 
 def get_shard_slice(items: List[Any], shard_id: int, num_shards: int) -> List[Any]:
@@ -174,6 +176,49 @@ ABLATION_PRESETS: Dict[str, Dict[str, Any]] = {
 }
 
 
+def build_sharded_dataset(
+    args: argparse.Namespace, is_train: bool = True, default_virtual_mult: int = 20
+) -> Dataset:
+    """
+    Auto-selects `RealVCMVideoDataset` (MOT17 / SFU-HW-Objects-v1 / BDD100K) if
+    `--data_root` is provided or auto-detected in `/kaggle/input`; otherwise falls
+    back to `ShardedVideoClipDataset`.
+    """
+    data_root = args.data_root
+    if not data_root:
+        mounted = find_mounted_kaggle_dataset()
+        if mounted is not None:
+            data_root = str(mounted)
+        elif Path("./data/MOT17_sample").exists():
+            data_root = "./data/MOT17_sample"
+
+    if data_root and Path(data_root).exists():
+        real_ds = RealVCMVideoDataset(
+            data_root=data_root,
+            shard_id=args.shard_id,
+            num_shards=args.num_shards,
+            clip_len=args.clip_len,
+            stride=args.clip_len,
+            img_size=args.img_size,
+            is_train=is_train,
+        )
+        if len(real_ds) > 0:
+            print(
+                f"[Dataset] Loaded {len(real_ds)} real clips from '{data_root}' "
+                f"for shard {args.shard_id}/{args.num_shards}"
+            )
+            return real_ds
+
+    return ShardedVideoClipDataset(
+        data_root=data_root,
+        shard_id=args.shard_id,
+        num_shards=args.num_shards,
+        clip_len=args.clip_len,
+        img_size=args.img_size,
+        total_virtual_clips=args.num_shards * default_virtual_mult,
+    )
+
+
 def run_train_shard(args: argparse.Namespace) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     n_gpus = torch.cuda.device_count()
@@ -184,14 +229,7 @@ def run_train_shard(args: argparse.Namespace) -> None:
         f"Variant={args.variant} | Device={device} (GPUs={n_gpus})"
     )
 
-    dataset = ShardedVideoClipDataset(
-        data_root=args.data_root,
-        shard_id=args.shard_id,
-        num_shards=args.num_shards,
-        clip_len=args.clip_len,
-        img_size=args.img_size,
-        total_virtual_clips=args.num_shards * 20,
-    )
+    dataset = build_sharded_dataset(args, is_train=True, default_virtual_mult=20)
     loader = DataLoader(
         dataset, batch_size=args.batch_size, shuffle=True, num_workers=2, pin_memory=True
     )
@@ -317,14 +355,7 @@ def run_poc_wishlist2_and_eval_shard(args: argparse.Namespace) -> None:
       - Task feature fidelity (FPN PSNR / Cosine similarity inside GT object mask M_det)
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    dataset = ShardedVideoClipDataset(
-        data_root=args.data_root,
-        shard_id=args.shard_id,
-        num_shards=args.num_shards,
-        clip_len=args.clip_len,
-        img_size=args.img_size,
-        total_virtual_clips=args.num_shards * 5,
-    )
+    dataset = build_sharded_dataset(args, is_train=False, default_virtual_mult=5)
 
     model = TemporalSCOPE(base_ch=48, num_families=4, cond_dim=64, qg_size=16, max_delta_qp=4.0).to(device)
     if args.ckpt and Path(args.ckpt).exists():

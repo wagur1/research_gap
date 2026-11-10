@@ -40,6 +40,9 @@ VARIANT = "full_tscope"  # Hoặc: spatial_only_scope | wo_ctu_delta_qp | iwa_go
 !git clone https://github.com/wagur1/research_gap.git /kaggle/working/research_gap || (cd /kaggle/working/research_gap && git pull)
 %cd /kaggle/working/research_gap
 
+# 0. Tự động nhận diện /kaggle/input/mot17 (hoặc bdd100k, sfu-hw-objects-v1) và tải nhãn chuẩn MPEG-VCM SFU-HW
+!python scripts/prepare_kaggle_datasets.py --target_dir /kaggle/working/data --download_sfu_labels
+
 # 1. Chạy thử nghiệm Wish-List #2 (So sánh P-frame bitrate giữa Spatial SCOPE vs. T-SCOPE) trên Shard hiện tại
 !python scripts/kaggle_shard_runner.py \
     --mode eval_poc \
