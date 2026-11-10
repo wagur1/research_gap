@@ -362,7 +362,7 @@ def run_poc_wishlist2_and_eval_shard(args: argparse.Namespace) -> None:
 
             # 3. T-SCOPE (Temporally-Locked Background + CTU Delta-QP Coupling)
             pred_tscope = model(video, fam, sev, reuse_iframe_qp=False)
-            eff_attn = torch.maximum(pred_tscope["attn_map"] * m_det, m_attn)
+            eff_attn = torch.maximum(pred_tscope["attn_map"] * m_det, m_det)
             bg_locked = blur_v[:, 0:1].expand_as(blur_v)
             v_tscope = eff_attn * video + (1.0 - eff_attn) * bg_locked
             ctu_qp = model.compute_ctu_qp_offsets(eff_attn)
