@@ -191,6 +191,14 @@ def push_all_shards(args: argparse.Namespace, accounts: List[Tuple[str, str]]) -
                 res = api.kernels_push(str(tmp_path))
                 ref_url = getattr(res, "url", "") or ""
                 err_msg = getattr(res, "error", "") or ""
+                if not ref_url and ("GPU" in err_msg or "quota" in err_msg.lower()):
+                    metadata["enable_gpu"] = "false"
+                    (tmp_path / "kernel-metadata.json").write_text(
+                        json.dumps(metadata, indent=2), encoding="utf-8"
+                    )
+                    res_cpu = api.kernels_push(str(tmp_path))
+                    ref_url = getattr(res_cpu, "url", "") or ""
+                    err_msg = f"(CPU fallback) {getattr(res_cpu, 'error', '') or ''}"
                 print(
                     f"  [Shard {shard_id:02d}/{num_shards:02d}] Pushed -> {kernel_id:<38} "
                     f"| variant={variant:<18} | {ref_url} {err_msg}"
