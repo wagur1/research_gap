@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+outputs/
+*.pt
+*.pth
+*.hevc
+*.rgb
+.DS_Store
