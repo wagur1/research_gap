@@ -6,8 +6,11 @@ from typing import Optional
 
 
 KAGGLE_SEARCH_PATHS = [
-    "/kaggle/input/mot17",
+    "/kaggle/input/mot17challenge/MOT17/train",
+    "/kaggle/input/mot17challenge",
+    "/kaggle/input/mot-17/MOT17/train",
     "/kaggle/input/mot-17",
+    "/kaggle/input/mot17",
     "/kaggle/input/motchallenge-mot17",
     "/kaggle/input/sfu-hw-objects-v1",
     "/kaggle/input/bdd100k",

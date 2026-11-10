@@ -220,6 +220,8 @@ class RealVCMVideoDataset(Dataset):
             if any(tag in seq_dir.name for tag in ("-SDP", "-DPM")):
                 continue
             gt_path = seq_dir / "gt" / "gt.txt"
+            if not gt_path.exists():
+                continue
             gt_map = parse_mot_gt_file(gt_path)
             frames = sorted(img1_dir.glob("*.jpg")) + sorted(img1_dir.glob("*.png"))
             for start in range(0, len(frames) - self.clip_len + 1, self.stride):

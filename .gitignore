@@ -5,6 +5,7 @@ __pycache__/
 venv/
 outputs/
 data/
+*pool*.json
 *.pt
 *.pth
 *.hevc
