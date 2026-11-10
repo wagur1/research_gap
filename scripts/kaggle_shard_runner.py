@@ -390,18 +390,19 @@ def run_poc_wishlist2_and_eval_shard(args: argparse.Namespace) -> None:
             # 1. Baseline Direct Codec (Anchor)
             base_out = codec.proxy(video, sev, None)
 
-            # 2. Spatial-Only Frame-by-Frame Pre-Editing (Simulating independent per-frame SCOPE jitter)
+            # Predict T-SCOPE attention & temporal state
+            pred_tscope = model(video, fam, sev, reuse_iframe_qp=False)
+            eff_attn = torch.maximum(pred_tscope["attn_map"] * m_det, m_det)
             blur_v = gaussian_blur_5x5(video.view(b * t, 3, h, w)).view(b, t, 3, h, w)
-            # Independent per-frame residual jitter in background/foreground
-            spatial_jitter = 0.02 * torch.randn_like(video)
-            v_spatial_scope = m_attn * torch.clamp(video + spatial_jitter, 0.0, 1.0) + (
-                1.0 - m_attn
-            ) * torch.clamp(blur_v + 0.5 * spatial_jitter, 0.0, 1.0)
+
+            # 2. Spatial-Only Frame-by-Frame Pre-Editing (SCOPE: clean ROI, independent per-frame background)
+            spatial_jitter = 0.015 * torch.randn_like(video)
+            v_spatial_scope = eff_attn * video + (1.0 - eff_attn) * torch.clamp(
+                blur_v + spatial_jitter, 0.0, 1.0
+            )
             spatial_out = codec.proxy(v_spatial_scope, sev, None)
 
             # 3. T-SCOPE (Temporally-Locked Background + CTU Delta-QP Coupling)
-            pred_tscope = model(video, fam, sev, reuse_iframe_qp=False)
-            eff_attn = torch.maximum(pred_tscope["attn_map"] * m_det, m_det)
             bg_locked = blur_v[:, 0:1].expand_as(blur_v)
             v_tscope = eff_attn * video + (1.0 - eff_attn) * bg_locked
             ctu_qp = model.compute_ctu_qp_offsets(eff_attn)
