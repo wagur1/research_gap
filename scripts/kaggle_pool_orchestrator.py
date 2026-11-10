@@ -93,6 +93,7 @@ if RUN_MODE in ("eval_poc", "both"):
         "--shard_id", str(SHARD_ID),
         "--num_shards", str(NUM_SHARDS),
         "--img_size", str(IMG_SIZE),
+        "--use_pretrained_fpn",
         "--output_dir", "/kaggle/working",
     ]
     subprocess.run(cmd_eval, check=True)
@@ -109,6 +110,7 @@ if RUN_MODE in ("train", "both"):
         "--batch_size", str(BATCH_SIZE),
         "--img_size", str(IMG_SIZE),
         "--enable_x265_ste",
+        "--use_pretrained_fpn",
         "--output_dir", "/kaggle/working",
     ]
     subprocess.run(cmd_train, check=True)

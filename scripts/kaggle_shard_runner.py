@@ -20,6 +20,7 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from models.temporal_scope import TemporalSCOPE, gaussian_blur_5x5
+from models.frozen_detector_fpn import FrozenFPNDetectorTeacher
 from video_codecs.hybrid_x265_ste import HybridX265STE
 from losses.vcm_temporal_loss import VCMTemporalPreEditLoss
 from datasets.vcm_video_datasets import RealVCMVideoDataset
@@ -251,6 +252,8 @@ def run_train_shard(args: argparse.Namespace) -> None:
         use_real_x265_in_forward=preset_cfg["use_real_x265_ste"] and args.enable_x265_ste
     ).to(device)
 
+    fpn_teacher = FrozenFPNDetectorTeacher(pretrained=args.use_pretrained_fpn).to(device)
+
     criterion = VCMTemporalPreEditLoss(
         lambda_temp_bg=preset_cfg["lambda_temp_bg"],
         lambda_temp_obj=preset_cfg["lambda_temp_obj"],
@@ -290,17 +293,12 @@ def run_train_shard(args: argparse.Namespace) -> None:
                     out["i_edit"], severity, out["ctu_qp_offsets"]
                 )
 
-                # Multi-scale feature consistency (P2, P3, P4)
+                # Multi-scale FPN feature consistency (P2..P5 from FrozenFPNDetectorTeacher)
                 i_clean_flat = video.view(b * t, 3, h, w)
                 i_recon_flat = codec_out["video_recon"].view(b * t, 3, h, w)
-                teacher_fpn = {
-                    "p2": torch.nn.functional.avg_pool2d(i_clean_flat, 4).detach(),
-                    "p3": torch.nn.functional.avg_pool2d(i_clean_flat, 8).detach(),
-                }
-                student_fpn = {
-                    "p2": torch.nn.functional.avg_pool2d(i_recon_flat, 4),
-                    "p3": torch.nn.functional.avg_pool2d(i_recon_flat, 8),
-                }
+                with torch.no_grad():
+                    teacher_fpn = fpn_teacher.extract_fpn_features(i_clean_flat)
+                student_fpn = fpn_teacher.extract_fpn_features(i_recon_flat)
 
                 losses = criterion(
                     i_edit=out["i_edit"],
@@ -364,6 +362,7 @@ def run_poc_wishlist2_and_eval_shard(args: argparse.Namespace) -> None:
     model.eval()
 
     codec = HybridX265STE(use_real_x265_in_forward=True).to(device)
+    fpn_teacher = FrozenFPNDetectorTeacher(pretrained=args.use_pretrained_fpn).to(device)
     qps = [27, 32, 37, 42, 47]
 
     shard_records = []
@@ -410,9 +409,8 @@ def run_poc_wishlist2_and_eval_shard(args: argparse.Namespace) -> None:
                 p_frame_bpp = float(np.mean(rate_frames[1:])) if len(rate_frames) > 1 else i_frame_bpp
                 total_bpp = float(np.mean(rate_frames))
 
-                # Task-region fidelity (PSNR inside detector mask M_det -> monotonic proxy for mAP)
-                mse_obj = ((m_det * (video - recon)) ** 2).sum() / (m_det.sum() * 3.0 + 1e-6)
-                psnr_obj = float(10.0 * torch.log10(1.0 / (mse_obj + 1e-8)).item())
+                # Task-region fidelity & FPN feature cosine similarity inside M_det
+                acc_metrics = fpn_teacher.evaluate_task_accuracy(video, recon, m_det)
 
                 shard_records.append(
                     {
@@ -423,7 +421,8 @@ def run_poc_wishlist2_and_eval_shard(args: argparse.Namespace) -> None:
                         "total_bpp": round(total_bpp, 5),
                         "i_frame_bpp": round(i_frame_bpp, 5),
                         "p_frame_bpp": round(p_frame_bpp, 5),
-                        "task_roi_psnr_db": round(psnr_obj, 3),
+                        "task_roi_psnr_db": acc_metrics["task_roi_psnr_db"],
+                        "fpn_cos_sim_pct": acc_metrics["fpn_cos_sim_pct"],
                     }
                 )
 
@@ -450,6 +449,7 @@ def main() -> None:
     parser.add_argument("--img_size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--enable_x265_ste", action="store_true")
+    parser.add_argument("--use_pretrained_fpn", action="store_true", help="Use torchvision Faster R-CNN ResNet50-FPN v2")
     args = parser.parse_args()
 
     if args.mode == "train":
