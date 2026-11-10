@@ -87,18 +87,7 @@ subprocess.run(
 env = os.environ.copy()
 env["PYTHONPATH"] = str(repo_dir) + os.pathsep + env.get("PYTHONPATH", "")
 
-if RUN_MODE in ("eval_poc", "both"):
-    cmd_eval = [
-        sys.executable,
-        str(repo_dir / "scripts" / "kaggle_shard_runner.py"),
-        "--mode", "eval_poc",
-        "--shard_id", str(SHARD_ID),
-        "--num_shards", str(NUM_SHARDS),
-        "--img_size", str(IMG_SIZE),
-        "--use_pretrained_fpn",
-        "--output_dir", "/kaggle/working",
-    ]
-    subprocess.run(cmd_eval, cwd=str(repo_dir), env=env, check=True)
+ckpt_path = f"/kaggle/working/tscope_{{VARIANT}}_shard{{SHARD_ID:02d}}of{{NUM_SHARDS:02d}}.pt"
 
 if RUN_MODE in ("train", "both"):
     cmd_train = [
@@ -116,6 +105,21 @@ if RUN_MODE in ("train", "both"):
         "--output_dir", "/kaggle/working",
     ]
     subprocess.run(cmd_train, cwd=str(repo_dir), env=env, check=True)
+
+if RUN_MODE in ("eval_poc", "both"):
+    cmd_eval = [
+        sys.executable,
+        str(repo_dir / "scripts" / "kaggle_shard_runner.py"),
+        "--mode", "eval_poc",
+        "--shard_id", str(SHARD_ID),
+        "--num_shards", str(NUM_SHARDS),
+        "--variant", VARIANT,
+        "--img_size", str(IMG_SIZE),
+        "--ckpt", ckpt_path,
+        "--use_pretrained_fpn",
+        "--output_dir", "/kaggle/working",
+    ]
+    subprocess.run(cmd_eval, cwd=str(repo_dir), env=env, check=True)
 
 print(f"=== Shard {{SHARD_ID}}/{{NUM_SHARDS}} ({{VARIANT}}) finished successfully! ===")
 '''

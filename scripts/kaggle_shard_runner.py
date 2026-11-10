@@ -194,18 +194,20 @@ def build_sharded_dataset(
             data_root = "./data/MOT17_sample"
 
     if data_root and Path(data_root).exists():
+        stride = max(1, args.clip_len // 2) if is_train else args.clip_len
         real_ds = RealVCMVideoDataset(
             data_root=data_root,
             shard_id=args.shard_id,
             num_shards=args.num_shards,
             clip_len=args.clip_len,
-            stride=args.clip_len,
+            stride=stride,
             img_size=args.img_size,
             is_train=is_train,
         )
         if len(real_ds) > 0:
             print(
-                f"[Dataset] Loaded {len(real_ds)} real clips from '{data_root}' "
+                f"[Dataset] Loaded {len(real_ds)} real MOT17/VCM clips "
+                f"({len(real_ds) * args.clip_len} frames, stride={stride}) from '{data_root}' "
                 f"for shard {args.shard_id}/{args.num_shards}"
             )
             return real_ds
@@ -351,10 +353,21 @@ def run_poc_wishlist2_and_eval_shard(args: argparse.Namespace) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dataset = build_sharded_dataset(args, is_train=False, default_virtual_mult=5)
 
-    model = TemporalSCOPE(base_ch=48, num_families=4, cond_dim=64, qg_size=16, max_delta_qp=4.0).to(device)
+    is_real_mot = isinstance(dataset, RealVCMVideoDataset)
+    ds_tag = "MOT17_real" if is_real_mot else "synthetic"
+    preset_cfg = ABLATION_PRESETS[args.variant]
+
+    model = TemporalSCOPE(
+        base_ch=48,
+        num_families=4,
+        cond_dim=64,
+        qg_size=16,
+        max_delta_qp=preset_cfg["max_delta_qp"],
+    ).to(device)
     if args.ckpt and Path(args.ckpt).exists():
         ckpt = torch.load(args.ckpt, map_location=device)
         model.load_state_dict(ckpt["state_dict"], strict=False)
+        print(f"[Eval Shard {args.shard_id}] Loaded trained checkpoint: {args.ckpt}")
     model.eval()
 
     codec = HybridX265STE(use_real_x265_in_forward=True).to(device)
@@ -411,6 +424,8 @@ def run_poc_wishlist2_and_eval_shard(args: argparse.Namespace) -> None:
                 shard_records.append(
                     {
                         "shard_id": args.shard_id,
+                        "variant": args.variant,
+                        "dataset": ds_tag,
                         "clip_id": clip_id,
                         "qp": qp,
                         "method": method_name,

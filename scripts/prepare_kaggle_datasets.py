@@ -18,21 +18,26 @@ KAGGLE_SEARCH_PATHS = [
 
 
 def find_mounted_kaggle_dataset() -> Optional[Path]:
-    """Checks if MOT17, SFU-HW-Objects-v1, or BDD100K is already mounted in /kaggle/input."""
+    """Recursively detects MOT17, SFU-HW-Objects-v1, or BDD100K inside /kaggle/input."""
+    kaggle_in = Path("/kaggle/input")
+    if kaggle_in.exists():
+        # 1. Look for MOT17/MOT20 train sequences containing both `img1` and `gt/gt.txt`
+        for gt_file in kaggle_in.rglob("gt.txt"):
+            seq_dir = gt_file.parent.parent
+            if (seq_dir / "img1").is_dir():
+                train_root = seq_dir.parent
+                print(f"[Dataset Auto-Detect] Found real MOT train root at: {train_root}")
+                return train_root
+        # 2. Look for SFU-HW raw YUV files
+        for yuv_file in kaggle_in.rglob("*.yuv"):
+            print(f"[Dataset Auto-Detect] Found raw YUV root at: {yuv_file.parent}")
+            return yuv_file.parent
+
     for p_str in KAGGLE_SEARCH_PATHS:
         p = Path(p_str)
         if p.exists():
             print(f"[Dataset Auto-Detect] Found mounted Kaggle dataset at: {p}")
             return p
-
-    kaggle_in = Path("/kaggle/input")
-    if kaggle_in.exists():
-        for child in kaggle_in.iterdir():
-            if child.is_dir() and any(
-                k in child.name.lower() for k in ("mot", "sfu", "bdd", "kitti")
-            ):
-                print(f"[Dataset Auto-Detect] Found mounted dataset at: {child}")
-                return child
     return None
 
 
