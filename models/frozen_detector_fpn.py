@@ -47,13 +47,8 @@ class FrozenFPNDetectorTeacher(nn.Module):
     def normalize(self, x: torch.Tensor) -> torch.Tensor:
         return (x - self.mean.to(dtype=x.dtype)) / self.std.to(dtype=x.dtype)
 
-    def extract_fpn_features(self, images: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """
-        Args:
-            images: [N, 3, H, W] in [0, 1]. Let gradients flow if images.requires_grad is True.
-        Returns:
-            Dict mapping level name -> feature tensor [N, C_l, H_l, W_l].
-        """
+    def extract_backbone_fpn_features(self, images: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """Full ResNet50-FPN v2 feature extractor (used during evaluation)."""
         x_norm = self.normalize(images)
         if self.use_torchvision and self.detector is not None:
             self.detector.eval()
@@ -63,8 +58,11 @@ class FrozenFPNDetectorTeacher(nn.Module):
                 for idx, (_, feat) in enumerate(feats.items())
                 if idx < 4
             }
+        return self.extract_fast_pyramid(images)
 
-        # Lightweight deterministic multi-scale gradient + spatial pyramid fallback
+    def extract_fast_pyramid(self, images: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """Fast differentiable multi-scale spatial+gradient pyramid."""
+        x_norm = self.normalize(images)
         dx = x_norm[..., :, 1:] - x_norm[..., :, :-1]
         dy = x_norm[..., 1:, :] - x_norm[..., :-1, :]
         dx = F.pad(dx, (0, 1, 0, 0))
@@ -75,6 +73,15 @@ class FrozenFPNDetectorTeacher(nn.Module):
             "p3": F.avg_pool2d(feat_base, kernel_size=8, stride=8),
             "p4": F.avg_pool2d(feat_base, kernel_size=16, stride=16),
         }
+
+    def extract_fpn_features(self, images: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """
+        Args:
+            images: [N, 3, H, W] in [0, 1]. Let gradients flow if images.requires_grad is True.
+        Returns:
+            Dict mapping level name -> feature tensor [N, C_l, H_l, W_l].
+        """
+        return self.extract_backbone_fpn_features(images)
 
     @staticmethod
     def _extract_connected_boxes_from_mask(mask_2d: torch.Tensor) -> torch.Tensor:
@@ -89,53 +96,153 @@ class FrozenFPNDetectorTeacher(nn.Module):
         )
 
     @staticmethod
+    def compute_dataset_level_ap(
+        all_gt_boxes: List[torch.Tensor],
+        all_pred_boxes: List[torch.Tensor],
+        all_pred_scores: List[torch.Tensor],
+        all_ignore_boxes: Optional[List[torch.Tensor]] = None,
+        iou_thresh: float = 0.50,
+    ) -> float:
+        """
+        Official Dataset-Level COCO / Pascal VOC Average Precision (AP) at `iou_thresh` (R03 & R04 fix):
+          - Pools predictions across ALL evaluated images/frames simultaneously (including empty-GT images,
+            so false positives on empty images penalize precision).
+          - Sorts all predictions globally by descending confidence score.
+          - Within each image, matches a prediction to the highest-IoU UNMATCHED active GT box (`iou >= iou_thresh`).
+          - If a prediction does not match an active GT box, checks whether it overlaps an ignore/distractor
+            region (`iou >= iou_thresh`); if so, marks it ignored (neither TP nor FP, matching MOT17/COCO protocol).
+          - Integrates the precision-recall envelope over the exact 101-point COCO recall grid `[0.00, 0.01, ..., 1.00]`.
+        """
+        from torchvision.ops import box_iou
+
+        total_gt = sum(int(g.shape[0]) for g in all_gt_boxes)
+        if total_gt == 0:
+            return float("nan")
+
+        gt_matched = [
+            torch.zeros((g.shape[0],), dtype=torch.bool) for g in all_gt_boxes
+        ]
+
+        # Collect all predictions across the dataset: (score, img_idx, box_tensor_cpu)
+        flat_preds: List[Tuple[float, int, torch.Tensor]] = []
+        for img_idx, (pb, ps) in enumerate(zip(all_pred_boxes, all_pred_scores)):
+            pb_cpu = pb.detach().cpu()
+            ps_cpu = ps.detach().cpu()
+            for j in range(pb_cpu.shape[0]):
+                flat_preds.append((float(ps_cpu[j].item()), img_idx, pb_cpu[j : j + 1]))
+
+        if not flat_preds:
+            return 0.0
+
+        # Sort globally by descending confidence score
+        flat_preds.sort(key=lambda x: x[0], reverse=True)
+
+        tp_list: List[float] = []
+        fp_list: List[float] = []
+
+        for _, img_idx, pbox in flat_preds:
+            gboxes = all_gt_boxes[img_idx].detach().cpu()
+            matched_flags = gt_matched[img_idx]
+
+            # 1. Match against highest-IoU UNMATCHED active GT box
+            matched_active = False
+            if gboxes.shape[0] > 0:
+                ious = box_iou(pbox, gboxes)[0]  # [N_gt]
+                unmatched_indices = torch.where(~matched_flags)[0]
+                if unmatched_indices.numel() > 0:
+                    unmatched_ious = ious[unmatched_indices]
+                    best_rel_idx = int(torch.argmax(unmatched_ious).item())
+                    best_iou = float(unmatched_ious[best_rel_idx].item())
+                    if best_iou >= iou_thresh:
+                        best_gt_idx = int(unmatched_indices[best_rel_idx].item())
+                        matched_flags[best_gt_idx] = True
+                        tp_list.append(1.0)
+                        fp_list.append(0.0)
+                        matched_active = True
+
+            if matched_active:
+                continue
+
+            # 2. Check MOT17 ignore/distractor boxes (neither TP nor FP if IoU >= iou_thresh)
+            if all_ignore_boxes is not None and img_idx < len(all_ignore_boxes):
+                ig_boxes = all_ignore_boxes[img_idx].detach().cpu()
+                if ig_boxes.shape[0] > 0:
+                    ig_ious = box_iou(pbox, ig_boxes)[0]
+                    if float(ig_ious.max().item()) >= iou_thresh:
+                        continue
+
+            tp_list.append(0.0)
+            fp_list.append(1.0)
+
+        if not tp_list:
+            return 0.0
+
+        tp = torch.tensor(tp_list, dtype=torch.float64)
+        fp = torch.tensor(fp_list, dtype=torch.float64)
+        tp_cum = torch.cumsum(tp, dim=0)
+        fp_cum = torch.cumsum(fp, dim=0)
+
+        recall = tp_cum / float(total_gt)
+        precision = tp_cum / torch.clamp(tp_cum + fp_cum, min=1e-9)
+
+        # Make precision monotonically non-increasing from right to left
+        mpre = precision.clone()
+        for i in range(mpre.shape[0] - 2, -1, -1):
+            if mpre[i + 1] > mpre[i]:
+                mpre[i] = mpre[i + 1]
+
+        # Official 101-point COCO recall grid interpolation: r in {0.00, 0.01, ..., 1.00}
+        recall_grid = torch.linspace(0.0, 1.0, 101, dtype=torch.float64)
+        ap_vals = torch.zeros_like(recall_grid)
+        for r_idx, r_thr in enumerate(recall_grid):
+            inds = torch.where(recall >= r_thr)[0]
+            if inds.numel() > 0:
+                ap_vals[r_idx] = mpre[inds[0]]
+
+        return float(ap_vals.mean().item())
+
+    @staticmethod
+    def compute_dataset_level_coco_metrics(
+        all_gt_boxes: List[torch.Tensor],
+        all_pred_boxes: List[torch.Tensor],
+        all_pred_scores: List[torch.Tensor],
+        all_ignore_boxes: Optional[List[torch.Tensor]] = None,
+    ) -> Dict[str, float]:
+        """
+        Computes official dataset-level `gt_ap50_pct` (IoU=0.50) and `gt_ap50_95_pct`
+        (mean over IoU=0.50:0.05:0.95) across all evaluated frames.
+        """
+        iou_thresholds = [0.50 + 0.05 * i for i in range(10)]
+        aps = [
+            FrozenFPNDetectorTeacher.compute_dataset_level_ap(
+                all_gt_boxes,
+                all_pred_boxes,
+                all_pred_scores,
+                all_ignore_boxes=all_ignore_boxes,
+                iou_thresh=thr,
+            )
+            for thr in iou_thresholds
+        ]
+        if any(math.isnan(x) for x in aps):
+            return {"gt_ap50_pct": float("nan"), "gt_ap50_95_pct": float("nan")}
+        return {
+            "gt_ap50_pct": round(float(aps[0] * 100.0), 3),
+            "gt_ap50_95_pct": round(float(sum(aps) / len(aps) * 100.0), 3),
+        }
+
+    @staticmethod
     def _compute_ap_at_iou(
         gt_boxes: torch.Tensor,
         pred_boxes: torch.Tensor,
         pred_scores: torch.Tensor,
         iou_thresh: float = 0.5,
+        ignore_boxes: Optional[torch.Tensor] = None,
     ) -> float:
-        """
-        Computes Pascal VOC / COCO single-threshold Average Precision (AP) at `iou_thresh`
-        using greedy score-sorted one-to-one GT matching.
-        """
-        from torchvision.ops import box_iou
-
-        num_gt = gt_boxes.shape[0]
-        if num_gt == 0:
-            return 1.0 if pred_boxes.shape[0] == 0 else 0.0
-        if pred_boxes.shape[0] == 0:
-            return 0.0
-
-        order = torch.argsort(pred_scores, descending=True)
-        pred_boxes = pred_boxes[order]
-
-        ious = box_iou(pred_boxes, gt_boxes)  # [N_pred, N_gt]
-        gt_matched = torch.zeros((num_gt,), dtype=torch.bool, device=gt_boxes.device)
-        tp = torch.zeros((pred_boxes.shape[0],), dtype=torch.float32, device=gt_boxes.device)
-        fp = torch.zeros((pred_boxes.shape[0],), dtype=torch.float32, device=gt_boxes.device)
-
-        for i in range(pred_boxes.shape[0]):
-            best_iou, best_gt = ious[i].max(dim=0)
-            if float(best_iou.item()) >= iou_thresh and not gt_matched[best_gt]:
-                tp[i] = 1.0
-                gt_matched[best_gt] = True
-            else:
-                fp[i] = 1.0
-
-        tp_cum = torch.cumsum(tp, dim=0)
-        fp_cum = torch.cumsum(fp, dim=0)
-        recall = tp_cum / float(num_gt)
-        precision = tp_cum / torch.clamp(tp_cum + fp_cum, min=1e-6)
-
-        # 101-point COCO / VOC interpolated AP
-        mrec = torch.cat([torch.tensor([0.0], device=gt_boxes.device), recall, torch.tensor([1.0], device=gt_boxes.device)])
-        mpre = torch.cat([torch.tensor([1.0], device=gt_boxes.device), precision, torch.tensor([0.0], device=gt_boxes.device)])
-        for i in range(mpre.shape[0] - 2, -1, -1):
-            mpre[i] = torch.maximum(mpre[i], mpre[i + 1])
-        idx = torch.where(mrec[1:] != mrec[:-1])[0]
-        ap = torch.sum((mrec[idx + 1] - mrec[idx]) * mpre[idx + 1])
-        return float(ap.item())
+        """Single-clip wrapper calling the exact 101-point unmatched-GT AP routine."""
+        ig_list = [ignore_boxes] if ignore_boxes is not None else None
+        return FrozenFPNDetectorTeacher.compute_dataset_level_ap(
+            [gt_boxes], [pred_boxes], [pred_scores], all_ignore_boxes=ig_list, iou_thresh=iou_thresh
+        )
 
     @torch.no_grad()
     def evaluate_task_accuracy(
@@ -144,17 +251,20 @@ class FrozenFPNDetectorTeacher(nn.Module):
         recon_video: torch.Tensor,
         m_det: torch.Tensor,
         gt_boxes: Optional[torch.Tensor] = None,
+        ignore_boxes: Optional[torch.Tensor] = None,
         require_real_detector: bool = False,
-    ) -> Dict[str, float]:
+        return_raw_detections: bool = False,
+        cached_clean_info: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         """
         Computes downstream machine vision task accuracy metrics between clean video,
-        compressed/reconstructed video, and true Ground-Truth bounding boxes (`gt/gt.txt`):
+        compressed/reconstructed video, and true Ground-Truth pedestrian bounding boxes (`gt/gt.txt`):
           1. `gt_ap50_pct` (0..100%): Real Faster R-CNN AP@IoU=0.50 against ground-truth `gt/gt.txt` boxes (class=person).
           2. `gt_ap50_95_pct` (0..100%): Real Faster R-CNN COCO AP@[.50:.95] against ground-truth `gt/gt.txt` boxes.
           3. `teacher_ap50_pct` (0..100%): Teacher-prediction retention AP@0.50 (reported separately).
           4. `fpn_cos_sim_pct` (0..100%): Masked FPN feature cosine similarity inside M_det.
           5. `task_roi_psnr_db`: Signal fidelity inside the detector context mask M_det.
-        Never converts PSNR/cosine into synthetic mAP (Gate 0.5 / F04 fix).
+        Never converts PSNR/cosine into synthetic mAP and never averages -1.0 sentinels (R03/R04 fix).
         """
         if require_real_detector and (not self.use_torchvision or self.detector is None):
             raise RuntimeError(
@@ -166,79 +276,110 @@ class FrozenFPNDetectorTeacher(nn.Module):
         recon_flat = recon_video.view(b * t, c, h, w)
         m_det_flat = m_det.view(b * t, 1, h, w)
 
-        t_feats = self.extract_fpn_features(clean_flat)
-        s_feats = self.extract_fpn_features(recon_flat)
+        t_feats = (
+            cached_clean_info["t_feats"]
+            if cached_clean_info is not None and "t_feats" in cached_clean_info
+            else self.extract_fast_pyramid(clean_flat)
+        )
+        s_feats = self.extract_fast_pyramid(recon_flat)
 
         cos_scores: List[float] = []
         for k, f_t in t_feats.items():
             f_s = s_feats[k]
             m_l = F.interpolate(m_det_flat, size=f_t.shape[-2:], mode="nearest")
-            cos_map = F.cosine_similarity(f_t, f_s, dim=1, eps=1e-6).unsqueeze(1)
-            masked_cos = (m_l * cos_map).sum() / (m_l.sum() + 1e-6)
-            cos_scores.append(float(masked_cos.item()) * 100.0)
+            if float(m_l.sum().item()) > 0:
+                cos_map = F.cosine_similarity(f_t.to(f_s.device), f_s, dim=1, eps=1e-6).unsqueeze(1)
+                masked_cos = (m_l * cos_map).sum() / (m_l.sum() + 1e-6)
+                cos_scores.append(float(masked_cos.item()) * 100.0)
 
-        fpn_cos_pct = float(sum(cos_scores) / max(1, len(cos_scores)))
+        fpn_cos_pct = float(sum(cos_scores) / len(cos_scores)) if cos_scores else float("nan")
 
-        mse_obj = ((m_det * (clean_video - recon_video)) ** 2).sum() / (
-            m_det.sum() * 3.0 + 1e-6
-        )
-        psnr_obj = float(10.0 * torch.log10(1.0 / (mse_obj + 1e-8)).item())
+        if float(m_det.sum().item()) > 0:
+            mse_obj = ((m_det * (clean_video - recon_video)) ** 2).sum() / (
+                m_det.sum() * 3.0 + 1e-6
+            )
+            psnr_obj = float(10.0 * torch.log10(1.0 / (mse_obj + 1e-8)).item())
+        else:
+            mse_all = ((clean_video - recon_video) ** 2).mean()
+            psnr_obj = float(10.0 * torch.log10(1.0 / (mse_all + 1e-8)).item())
 
         gt_ap50_pct = float("nan")
         gt_ap50_95_pct = float("nan")
         teacher_ap50_pct = float("nan")
 
+        clip_gt_boxes: List[torch.Tensor] = []
+        clip_ig_boxes: List[torch.Tensor] = []
+        clip_teacher_boxes: List[torch.Tensor] = []
+        clip_pred_boxes: List[torch.Tensor] = []
+        clip_pred_scores: List[torch.Tensor] = []
+
         if self.use_torchvision and self.detector is not None:
             self.detector.eval()
-            clean_dets = self.detector(list(torch.clamp(clean_flat, 0.0, 1.0)))
+            clean_dets = (
+                cached_clean_info["clean_dets"]
+                if cached_clean_info is not None and "clean_dets" in cached_clean_info
+                else self.detector(list(torch.clamp(clean_flat, 0.0, 1.0)))
+            )
             recon_dets = self.detector(list(torch.clamp(recon_flat, 0.0, 1.0)))
-            iou_thresholds = [0.50 + 0.05 * i for i in range(10)]
-
-            gt_ap50_list: List[float] = []
-            gt_ap50_95_list: List[float] = []
-            teacher_ap50_list: List[float] = []
 
             gt_flat = gt_boxes.view(b * t, -1, 4) if gt_boxes is not None else None
+            ig_flat = ignore_boxes.view(b * t, -1, 4) if ignore_boxes is not None else None
 
             for f_idx, (c_det, r_det) in enumerate(zip(clean_dets, recon_dets)):
                 # Filter predictions to COCO class 1 (person / pedestrian) for MOT17
-                person_mask_r = (r_det["labels"] == 1) & (r_det["scores"] >= 0.05)
-                pred_b = r_det["boxes"][person_mask_r]
-                pred_s = r_det["scores"][person_mask_r]
+                person_mask_r = (r_det["labels"] == 1) & (r_det["scores"] >= 0.01)
+                pred_b = r_det["boxes"][person_mask_r].detach().cpu()
+                pred_s = r_det["scores"][person_mask_r].detach().cpu()
+                clip_pred_boxes.append(pred_b)
+                clip_pred_scores.append(pred_s)
 
-                # 1. Official Ground-Truth AP against annotated gt/gt.txt boxes
                 if gt_flat is not None:
-                    f_gt = gt_flat[f_idx].to(pred_b.device)
+                    f_gt = gt_flat[f_idx].detach().cpu()
                     valid_gt = f_gt[f_gt[:, 0] >= 0.0]
-                    if valid_gt.shape[0] > 0:
-                        aps_gt = [
-                            self._compute_ap_at_iou(valid_gt, pred_b, pred_s, iou_thresh=thr)
-                            for thr in iou_thresholds
-                        ]
-                        gt_ap50_list.append(aps_gt[0] * 100.0)
-                        gt_ap50_95_list.append(float(sum(aps_gt) / len(aps_gt)) * 100.0)
+                    clip_gt_boxes.append(valid_gt)
+                else:
+                    clip_gt_boxes.append(torch.zeros((0, 4), dtype=torch.float32))
 
-                # 2. Separate Teacher-Agreement Retention AP@50 (clean detector person boxes score >= 0.5)
+                if ig_flat is not None:
+                    f_ig = ig_flat[f_idx].detach().cpu()
+                    valid_ig = f_ig[f_ig[:, 0] >= 0.0]
+                    clip_ig_boxes.append(valid_ig)
+                else:
+                    clip_ig_boxes.append(torch.zeros((0, 4), dtype=torch.float32))
+
                 person_mask_c = (c_det["labels"] == 1) & (c_det["scores"] >= 0.50)
-                t_gt_b = c_det["boxes"][person_mask_c]
-                if t_gt_b.shape[0] > 0:
-                    t_ap50 = self._compute_ap_at_iou(t_gt_b, pred_b, pred_s, iou_thresh=0.50)
-                    teacher_ap50_list.append(t_ap50 * 100.0)
+                t_gt_b = c_det["boxes"][person_mask_c].detach().cpu()
+                clip_teacher_boxes.append(t_gt_b)
 
-            if gt_ap50_list:
-                gt_ap50_pct = float(sum(gt_ap50_list) / len(gt_ap50_list))
-                gt_ap50_95_pct = float(sum(gt_ap50_95_list) / len(gt_ap50_95_list))
-            if teacher_ap50_list:
-                teacher_ap50_pct = float(sum(teacher_ap50_list) / len(teacher_ap50_list))
+            # Compute clip-level multi-frame pooled AP across all T frames (including empty frames!)
+            if gt_flat is not None:
+                coco_gt = self.compute_dataset_level_coco_metrics(
+                    clip_gt_boxes, clip_pred_boxes, clip_pred_scores, all_ignore_boxes=clip_ig_boxes
+                )
+                gt_ap50_pct = coco_gt["gt_ap50_pct"]
+                gt_ap50_95_pct = coco_gt["gt_ap50_95_pct"]
 
-        return {
-            "gt_ap50_pct": round(gt_ap50_pct, 3) if not math.isnan(gt_ap50_pct) else -1.0,
-            "gt_ap50_95_pct": round(gt_ap50_95_pct, 3) if not math.isnan(gt_ap50_95_pct) else -1.0,
-            "teacher_ap50_pct": round(teacher_ap50_pct, 3) if not math.isnan(teacher_ap50_pct) else -1.0,
-            "map50_pct": round(gt_ap50_pct if not math.isnan(gt_ap50_pct) else teacher_ap50_pct, 3)
-            if not (math.isnan(gt_ap50_pct) and math.isnan(teacher_ap50_pct))
-            else -1.0,
-            "map50_95_pct": round(gt_ap50_95_pct, 3) if not math.isnan(gt_ap50_95_pct) else -1.0,
-            "fpn_cos_sim_pct": round(fpn_cos_pct, 3),
+            t_ap = self.compute_dataset_level_ap(
+                clip_teacher_boxes, clip_pred_boxes, clip_pred_scores, iou_thresh=0.50
+            )
+            if not math.isnan(t_ap):
+                teacher_ap50_pct = round(float(t_ap * 100.0), 3)
+
+        out: Dict[str, Any] = {
+            "gt_ap50_pct": gt_ap50_pct,
+            "gt_ap50_95_pct": gt_ap50_95_pct,
+            "teacher_ap50_pct": teacher_ap50_pct,
+            "map50_pct": gt_ap50_pct,
+            "map50_95_pct": gt_ap50_95_pct,
+            "fpn_cos_sim_pct": round(fpn_cos_pct, 3) if not math.isnan(fpn_cos_pct) else float("nan"),
             "task_roi_psnr_db": round(psnr_obj, 3),
         }
+        if return_raw_detections:
+            out["raw_detections"] = {
+                "gt_boxes": clip_gt_boxes,
+                "ignore_boxes": clip_ig_boxes,
+                "teacher_boxes": clip_teacher_boxes,
+                "pred_boxes": clip_pred_boxes,
+                "pred_scores": clip_pred_scores,
+            }
+        return out

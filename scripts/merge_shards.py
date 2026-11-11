@@ -30,8 +30,8 @@ def bjontegaard_delta_rate(
 
     min_int = max(np.min(a1), np.min(a2))
     max_int = min(np.max(a1), np.max(a2))
-    if max_int <= min_int:
-        return 0.0
+    if max_int <= min_int or np.isnan(min_int) or np.isnan(max_int):
+        return float("nan")
 
     p1 = np.polyfit(a1, r1, deg=min(3, len(a1) - 1))
     p2 = np.polyfit(a2, r2, deg=min(3, len(a2) - 1))
@@ -117,30 +117,18 @@ def merge_eval_jsons_and_print_table(eval_dir: str) -> None:
             subset = [r for r in all_records if r["method"] == m and r["qp"] == qp]
             if not subset:
                 continue
+            gt_aps = [
+                r["gt_ap50_pct"]
+                for r in subset
+                if "gt_ap50_pct" in r and r["gt_ap50_pct"] is not None and not np.isnan(r["gt_ap50_pct"]) and r["gt_ap50_pct"] >= 0.0
+            ]
             summary[m][qp] = {
                 "total_bpp": float(np.mean([r["total_bpp"] for r in subset])),
                 "i_frame_bpp": float(np.mean([r["i_frame_bpp"] for r in subset])),
                 "p_frame_bpp": float(np.mean([r["p_frame_bpp"] for r in subset])),
                 "task_roi_psnr_db": float(np.mean([r["task_roi_psnr_db"] for r in subset])),
-                "map50_pct": float(
-                    np.mean(
-                        [
-                            r.get(
-                                "map50_pct",
-                                r.get("fpn_cos_sim_pct", 90.0)
-                                * (
-                                    0.65
-                                    + 0.35
-                                    * max(
-                                        0.0,
-                                        min(1.0, (r["task_roi_psnr_db"] - 18.0) / 22.0),
-                                    )
-                                ),
-                            )
-                            for r in subset
-                        ]
-                    )
-                ),
+                "gt_ap50_pct": float(np.mean(gt_aps)) if gt_aps else float("nan"),
+                "map50_pct": float(np.mean(gt_aps)) if gt_aps else float("nan"),
             }
 
     anchor = "anchor_x265"

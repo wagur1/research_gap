@@ -104,12 +104,14 @@ class VCMTemporalPreEditLoss(nn.Module):
             loss_det = loss_det + masked_diff
         loss_task = self.lambda_det * loss_det
 
-        # 2. Attention Supervision Loss (Eq. 17 in SCOPE) — disable AMP autocast for BCE safety on CUDA
+        # 2. Attention Supervision Loss (Eq. 17 in SCOPE) — asymmetric foreground-preserving BCE + Dice
+        # False negatives inside m_det destroy object edges, so weight m_det positive pixels 12x higher
         with torch.amp.autocast("cuda", enabled=False):
             attn_fp32 = torch.clamp(attn_map.float(), 1e-6, 1.0 - 1e-6)
-            target_fp32 = m_attn.float()
-            loss_bce = F.binary_cross_entropy(attn_fp32, target_fp32)
-        loss_dice = self.dice_loss(attn_map, m_attn)
+            target_fp32 = (0.75 * m_attn + 0.25 * m_det).float()
+            pixel_w = 1.0 + 11.0 * m_det.float()
+            loss_bce = F.binary_cross_entropy(attn_fp32, target_fp32, weight=pixel_w)
+        loss_dice = self.dice_loss(attn_map, m_det)
         loss_sparse = (m_bg * attn_map).mean()
         loss_att_group = (
             self.lambda_attn * (loss_bce + loss_dice)

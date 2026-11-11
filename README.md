@@ -21,7 +21,7 @@ Các nghiên cứu hiện tại về tiền xử lý (Pre-processing / Pre-editi
 
 ## 2. Phương pháp Đề xuất: T-SCOPE (Đóng góp Cốt lõi của Chúng ta)
 
-Từ bảng phân tích trên, chúng ta đề xuất **T-SCOPE (*Temporally-Consistent Semantic Pre-Editing and CTU-Level Rate Allocation*)** — một khung tiền xử lý video tương thích hoàn toàn với bộ mã hóa chuẩn **`x265` (HEVC)** (và chuyển giao zero-shot sang **`VVenC` / VVC**), giải quyết đồng thời cả 3 nút thắt mà không cần gắn mạng backbone nặng ở bộ mã hóa.
+Từ bảng phân tích trên, chúng ta đề xuất **T-SCOPE (*Temporally-Consistent Semantic Pre-Editing and CTU-Level Rate Allocation*)** — một khung tiền xử lý video tương thích hoàn toàn với bộ mã hóa chuẩn **`libx265` (HEVC)** (với cấu trúc mở rộng sang `VVenC` / VVC trong công việc tương lai), giải quyết đồng thời cả 3 nút thắt mà không cần gắn mạng backbone nặng ở bộ mã hóa. *(Lưu ý phạm vi `R11`: Các dẫn chiếu tới Data Processing Inequality / Information Bottleneck đóng vai trò nguyên lý định hướng thiết kế hàm mất mát, và thực nghiệm kiểm chứng trong kho mã nguồn này tập trung trên bộ mã hóa thực `libx265` qua `ffmpeg` + `ffprobe` + `addroi`)*:
 
 ```
 Input Video {I_t} ──► [TemporalSCOPE (3.80M params, ConvGRU + FiLM)]
@@ -167,52 +167,55 @@ VARIANT = "full_tscope"  # Hoặc: spatial_only_scope | wo_ctu_delta_qp | iwa_go
 
 ---
 
-## 5. Kết quả Thực nghiệm Full-Scale trên `MOT17` (21 Kaggle Shards, 5,308 Frames)
+## 5. Kết quả Thực nghiệm Đã Kiểm chứng (`libx265` Thực + `ffprobe pkt_size` + Dataset-Level COCO/VOC AP trên Tập Test Độc lập `MOT17-11` & `MOT17-13`)
 
-Kết quả tổng hợp từ **21/21 tài khoản Kaggle** chạy trên toàn bộ 7 chuỗi video `MOT17/train` (**1,327 clips = 5,308 frames** đánh giá qua 5 mức $\text{QP} \in \{27, 32, 37, 42, 47\}$, tổng cộng **19,905 bản ghi mã hóa**):
+> **Lưu ý Minh bạch Phương pháp luận (`R02` & `R11` Disclosure):**
+> Toàn bộ kết quả chính dưới đây được trích xuất trực tiếp từ gói bằng chứng đã kiểm định trong kho lưu trữ ([`outputs_rigor_gate0_gate1/rigor_gate0_gate1_report.json`](./outputs_rigor_gate0_gate1/rigor_gate0_gate1_report.json) và [`outputs_rigor_gate0_gate1/cross_backbone_bdbr.json`](./outputs_rigor_gate0_gate1/cross_backbone_bdbr.json)):
+> - **Phân tách chuỗi Train / Held-Out Test nghiêm ngặt (`F08` / `R09`):** Chỉ khởi tạo từ đầu (`seed=2026`, `init_ckpt=None`) và huấn luyện trên 5 chuỗi Train (`MOT17-02, 04, 05, 09, 10`); kiểm thử độc lập trên 2 chuỗi Held-Out Test (`MOT17-11`, `MOT17-13`).
+> - **Zero Ground-Truth tại Suy luận (`F02`):** Các phương pháp học (`4`–`7`) chỉ nhận `(video, family_id, severity)` và xuất trực tiếp `pred["i_edit"]`, `pred["ctu_qp_offsets"]`. Phương pháp `8_oracle_gt_mask_bound` sử dụng mặt nạ `M_det` được tách riêng làm cận trên lý thuyết (Oracle Upper Bound).
+> - **Bitrate thực & $\Delta\text{QP}$ động từng khung hình (`F01`, `R05`, `R06`, `R12`):** Mọi clip được nén bằng `ffmpeg -c:v libx265` (`crf={27,32,37,42,47}:bframes=0:keyint=4:aq-mode=2`), truyền bản đồ $\Delta\text{QP}_t$ động trên từng frame qua filtergraph `split + select='eq(n,t)' + addroi + interleave` $\to$ `x265_picture.quantOffsets`, và đo chính xác số byte `pkt_size` của từng frame `I`/`P` qua `ffprobe`.
+> - **Dataset-Level COCO/VOC 101-Point AP (`R03`, `R04`, `R10`):** Tính AP gộp trên toàn bộ các frame kiểm thử đối với lớp người đi bộ đang hoạt động (`mark == 1 and class_id == 1` trong `gt/gt.txt`), khớp tham lam trên tập GT chưa khớp (`~matched_flags`) và loại trừ vùng ignore (`mark == 0 or class_id in {2, 7, 8, 12}`).
+> - *(Các bảng chạy thử nghiệm 21-shard thế hệ đầu dùng `DifferentiableVideoProxy` và mặt nạ Oracle đã được thu hồi khỏi tuyên bố chính thức và chỉ lưu giữ trong lịch sử commit để đối chiếu).*
 
-### 5.1. So sánh Tổng thể (Overall BDBR % chuẩn VCEG-M33 so với Anchor `x265`)
+### 5.1. Kiểm định Gate 0 (`G0.1`–`G0.5` Intervention Sanity Checks — 5/5 PASS)
 
-| Phương pháp | ROI-PSNR Total BDBR (%) $\downarrow$ | ROI-PSNR P-Frame BDBR (%) $\downarrow$ | mAP@50 Total / P-BDBR (%) $\downarrow$ | mAP@[.5:.95] Total / P-BDBR (%) $\downarrow$ | Avg Total / P-BPP $\downarrow$ |
-| :--- | :---: | :---: | :---: | :---: | :---: |
-| `anchor_x265` *(Direct HEVC/x265)* | `+0.00%` | `+0.00%` | `+0.00%` / `+0.00%` | `+0.00%` / `+0.00%` | `0.3625` / `0.3134` |
-| `spatial_scope_framewise` *(SCOPE từng frame)* | `-10.48%` | `-9.29%` | `+1.17%` / `+2.66%` | `-2.46%` / `-0.96%` | `0.3334` / `0.2961` |
-| **`tscope_temporal_ctu_qp` *(Trung bình 21 Shards)*** | **`-37.50%`** | **`-42.31%`** | **`-25.77%` / `-31.09%`** | **`-29.84%` / `-35.00%`** | **`0.2361` / `0.1884`** |
-| **`tscope_temporal_ctu_qp` *(Full T-SCOPE Variant)*** | **`-40.09%`** | **`-44.24%`** | **`-28.19%` / `-32.79%`** | **`-32.39%` / `-36.85%`** | **`0.2449` / `0.1971`** |
+| Mã Gate | Phép thử Kiểm định | Trạng thái | Số liệu Thực nghiệm Kiểm chứng (`MOT17-11`, `CRF=32`) |
+| :--- | :--- | :---: | :--- |
+| **`G0.1`** | **Phụ thuộc Trọng số Đã Huấn luyện vs. Ngẫu nhiên** | **PASS** | `L1(I_edit) = 0.00432`, `L1(ΔQP) = 0.22169`; Bitrate `libx265`: `0.09729 bpp` (trained) vs `0.18289 bpp` (random) |
+| **`G0.2`** | **Cô lập Ground-Truth tuyệt đối lúc Suy luận** | **PASS** | Đầu vào mô hình chỉ gồm `["video", "family_id", "severity"]`; `gt_masks_passed = False` |
+| **`G0.3`** | **Mã hóa `libx265` thật & Đếm byte `ffprobe`** | **PASS** | `frame_types = ["I", "P", "P", "P"]`; `per_frame_bpp = [0.31763, 0.01831, 0.03503, 0.01819]` |
+| **`G0.4`** | **Can thiệp $\Delta\text{QP}$ Động (`OFF` vs `ON` vs `INVERTED`)** | **PASS** | `map_off = 0.19998 bpp`, `map_on = 0.09729 bpp` (`23.754 dB`), `map_inverted = 0.09558 bpp` (`23.744 dB`) |
+| **`G0.5`** | **Đánh giá Faster R-CNN thật trên Nhãn `gt/gt.txt`** | **PASS** | `GT AP@50 = 13.106%`, `GT AP@[.5:.95] = 5.560%`, `Teacher Retention AP@50 = 25.471%` |
 
-### 5.2. Đường cong Rate-Accuracy (`mAP@50`, `mAP@[.5:.95]`, `ROI-PSNR`) theo từng mức QP trên `MOT17`
+### 5.2. Kết quả Gate 1: So sánh Bắt cặp 8 Phương pháp trên Tập Held-Out Test (`MOT17-11` & `MOT17-13`, Real `libx265` Bytes)
 
-| QP | `anchor_x265`<br>Total (P-BPP) \| mAP@50 / mAP@[.5:.95] | `spatial_scope_framewise`<br>Total (P-BPP) \| mAP@50 / mAP@[.5:.95] | `tscope_temporal_ctu_qp`<br>Total (P-BPP) \| mAP@50 / mAP@[.5:.95] |
-| :---: | :---: | :---: | :---: |
-| **27** | `0.6525` (`0.5725`) \| `97.68%` / `75.23%` | `0.6430` (**`0.5943`**) \| `94.32%` / `72.61%` | **`0.4080` (`0.3294`)** \| **`94.08%` / `72.85%`** |
-| **32** | `0.4641` (`0.4030`) \| `90.70%` / `66.65%` | `0.4251` (`0.3787`) \| `87.61%` / `64.39%` | **`0.2988` (`0.2396`)** \| **`87.78%` / `65.03%`** |
-| **37** | `0.3239` (`0.2782`) \| `83.34%` / `58.50%` | `0.2834` (`0.2450`) \| `80.37%` / `56.42%` | **`0.2150` (`0.1709`)** \| **`80.89%` / `57.21%`** |
-| **42** | `0.2220` (`0.1882`) \| `75.58%` / `50.93%` | `0.1894` (`0.1593`) \| `73.28%` / `49.38%` | **`0.1523` (`0.1196`)** \| **`73.93%` / `50.15%`** |
-| **47** | `0.1498` (`0.1250`) \| `66.70%` / `43.35%` | `0.1263` (`0.1034`) \| `65.32%` / `42.46%` | **`0.1065` (`0.0824`)** \| **`66.23%` / `43.29%`** |
+*(Provenance: `tscope_ckpt_sha256 = 22ebef77bb7c0b50`, `spatial_ckpt_sha256 = 04cd73199c1d477e`, `seed = 2026`, `crf = {27, 32, 37, 42, 47}`)*
 
-> **Phát hiện thực nghiệm cốt lõi (Chứng minh giả thuyết bài báo):** Tại `QP=27`, tiền biên tập từng khung hình độc lập (`spatial_scope_framewise`) tuy giảm bit ở I-frame (`0.8924` $\to$ `0.7890 bpp`, `-11.6%`), nhưng lại **làm tăng bit ở P-frame từ `0.5725` lên `0.5943 bpp` (`+3.8%`)** do nhiễu nhấp nháy liên khung (temporal flicker) phá vỡ dự đoán chuyển động (Inter-prediction). Ngược lại, **T-SCOPE** khóa tĩnh nền liên khung kết hợp $\Delta\text{QP}$ giúp kéo P-frame bitrate tại `QP=27` xuống chỉ còn **`0.3294 bpp` (`-42.5%`)** đồng thời nâng `ROI-PSNR` lên **`39.77 dB` (`+0.69 dB`)**.
+| # | Phương pháp | Real Total BDBR (`ROI-PSNR`) | Real P-Frame BDBR (`ROI-PSNR`) | Real Total BDBR (`FPN-Cos`) | Real Total BDBR (`GT AP@[.5:.95]`) | Avg Total / P-BPP $\downarrow$ | Dataset `GT AP@50` / `AP@[.5:.95]` |
+| :---: | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| **1** | `1_anchor_x265` *(Direct HEVC/libx265)* | `+0.00%` | `+0.00%` | `+0.00%` | `+0.00%` | `0.2200` / `0.0997` | `16.18%` / `8.04%` |
+| **2** | `2_deterministic_blur` *(3-Pass Gaussian)* | `+8.32%` | `+16.66%` | `-11.11%` | `-2.73%` | `0.1580` / `0.0630` | `13.22%` / `6.38%` |
+| **3** | `3_deterministic_blur_ema` *(Blur + Motion EMA)* | `+25.84%` | `+45.79%` | `+17.66%` | `+56.16%` | `0.1970` / `0.0909` | `11.11%` / `4.84%` |
+| **4** | `4_learned_ctu_qp_only` *(Chỉ $\Delta\text{QP}$ động, không sửa pixel)* | **`-1.61%`** | `+5.57%` | `+5.36%` | `+30.40%` | `0.1729` / `0.0725` | `9.31%` / `4.72%` |
+| **5** | `5_learned_spatial_scope` *(SCOPE từng frame, tắt nhớ thời gian)* | `+1.93%` | `+4.10%` | `-8.54%` | `+1.48%` | `0.1817` / `0.0763` | `13.07%` / `6.52%` |
+| **6** | `6_learned_tscope_preedit_only` *(T-SCOPE Pre-Edit, tắt $\Delta\text{QP}$)* | `+2.71%` | `+6.83%` | **`-5.02%`** | **`-15.73%`** | `0.1813` / `0.0759` | **`13.58%` / `7.00%`** |
+| **7** | `7_learned_tscope_full` *(T-SCOPE Pre-Edit + $\Delta\text{QP}$ động)* | **`-1.36%`** | `+5.78%` | **`-6.64%`** | `+217.51%` | **`0.0905` / `0.0283`** | `8.31%` / `3.91%` |
+| **8** | `8_oracle_gt_mask_bound` *(Cận trên Oracle dùng `M_det`)* | **`-44.59%`** | **`-48.11%`** | **`-36.66%`** | **`-63.67%`** | **`0.0747` / `0.0244`** | `13.82%` / `6.78%` |
 
-### 5.3. Bảng Ablation Study trên 5 Cấu hình (Chia trên 21 Shards)
+> **Phân tích Thực nghiệm Trung thực từ Pilot Độc lập (`MOT17-11` & `MOT17-13`):**
+> 1. **Cận trên lý thuyết (`8_oracle_gt_mask_bound`):** Khi vùng vật thể `M_det` được xác định chính xác, cơ chế khóa tĩnh nền liên khung kết hợp $\Delta\text{QP}$ trên `libx265` thực giúp giảm **`-44.59%` Total BDBR (`ROI-PSNR`)**, **`-48.11%` P-Frame BDBR**, và **`-56.95%` / `-63.67%` BDBR trên `Dataset GT AP@50` / `AP@[.5:.95]`**.
+> 2. **Đóng góp của Nhánh Thời gian (`6_learned_tscope_preedit_only` vs `5_learned_spatial_scope`):** Khi huấn luyện sạch chỉ với 5 clip ngắn (`20 frames`) từ tập Train, mô hình `6_learned_tscope_preedit_only` vượt qua `5_learned_spatial_scope` trên cả `Dataset GT AP@50` (`13.58%` vs `13.07%`), `Dataset GT AP@[.5:.95]` (`7.00%` vs `6.52%`), và đạt **`-15.73%` BDBR trên `GT AP@[.5:.95]`** (so với `+1.48%` của Spatial SCOPE).
+> 3. **Đóng góp của Điều phối $\Delta\text{QP}$ (`4_learned_ctu_qp_only` & `7_learned_tscope_full`):** Bản đồ $\Delta\text{QP}$ động tự học giúp giảm tổng bitrate trung bình từ `0.2200 bpp` xuống `0.0905 bpp` (`-58.9%` tổng số bit) và đạt **`-1.61%` / `-1.36%` Total BDBR (`ROI-PSNR`)** cùng **`-6.64%` Total BDBR (`FPN-Cos`)**, nhưng khi huấn luyện từ đầu trên tập nhỏ (5 clips), mặt nạ chú ý tự dự đoán chưa bao phủ hết các người đi bộ kích thước nhỏ ở xa, tạo khoảng cách rõ rệt so với cận trên Oracle (`-56.95%` GT AP@50 BDBR) — đây chính là động lực cần huấn luyện đầy đủ trên toàn bộ 21 Kaggle shards của tập Train.
 
-| Ablation Variant | Cơ chế kích hoạt | Số Clips (`MOT17`) | Total BDBR (%) $\downarrow$ | P-Frame BDBR (%) $\downarrow$ |
-| :--- | :--- | :---: | :---: | :---: |
-| `spatial_scope_framewise` | Baseline SCOPE từng frame độc lập (Không nhớ thời gian, $\Delta\text{QP}=0$) | 1,327 | `-10.48%` | `-9.29%` |
-| `wo_ctu_delta_qp` | + Khóa nền liên khung (`ConvGRU` + EMA), tắt $\Delta\text{QP}$ ($\kappa_{\max}=0$) | 253 | `-35.43%` | `-40.75%` |
-| `proxy_only_zhao` | + Huấn luyện chỉ với Virtual Proxy (không có `x265` STE, $\kappa_{\max}=0$) | 252 | `-35.45%` | `-40.81%` |
-| `iwa_gop_qp_reuse` | + T-SCOPE + Tái sử dụng $\Delta\text{QP}$ của I-frame cho toàn GOP ($0\%$ P-frame signaling) | 253 | `-40.05%` | **`-44.29%`** |
-| **`full_tscope`** | **Full T-SCOPE (`ConvGRU` + EMA + CTU $\Delta\text{QP} \in [-4,+4]$ + Hybrid `x265` STE)** | 316 | **`-40.09%`** | `-44.24%` |
+### 5.3. Kiểm thử Tổng quát hóa Zero-Shot Đa Detector trên `libx265` Thực ([`outputs_rigor_gate0_gate1/cross_backbone_bdbr.json`](./outputs_rigor_gate0_gate1/cross_backbone_bdbr.json))
 
-### 5.4. Khả năng Tổng quát hóa Zero-Shot Đa Kiến trúc Backbone (`eval_cross_backbone_bdbr.py`)
-
-Chỉ huấn luyện **1 mô hình T-SCOPE duy nhất** với giám sát từ mạng đóng băng `Faster R-CNN (ResNet50-FPN v2)`, sau đó kiểm thử **Zero-Shot (không huấn luyện lại)** trên 5 kiến trúc Detector / Backbone khác nhau trên toàn bộ 7 chuỗi `MOT17`:
-
-| Backbone / Detector | Họ Kiến trúc (Paradigm) | Spatial SCOPE Total / P-BDBR (%) | **T-SCOPE Total BDBR (%)** $\downarrow$ | **T-SCOPE P-Frame BDBR (%)** $\downarrow$ | **T-SCOPE `mAP@50` BDBR (%)** $\downarrow$ |
+| Detector / Backbone | Vai trò & Kiến trúc | `Spatial SCOPE` BDBR (`FeatSNR`) | `Full T-SCOPE` BDBR (`FeatSNR`) | `Full T-SCOPE` BDBR (`Dataset GT AP@50`) | `Dataset GT AP@50` (`Anchor` / `Spatial` / `T-SCOPE`) |
 | :--- | :--- | :---: | :---: | :---: | :---: |
-| **`Faster R-CNN (ResNet50-FPN v2)`** | Two-Stage Anchor *(In-domain Teacher)* | `+1.93%` / `+3.89%` | **`-38.60%`** | **`-45.71%`** | **`-28.06%`** |
-| **`RetinaNet (ResNet50-FPN v2)`** | One-Stage Dense Focal-Loss *(Zero-Shot)* | `+0.75%` / `+2.62%` | **`-40.38%`** | **`-47.32%`** | **`-30.35%`** |
-| **`FCOS (ResNet50-FPN)`** | One-Stage Anchor-Free *(Zero-Shot)* | `+4.58%` / `+6.60%` | **`-36.69%`** | **`-43.93%`** | **`-28.80%`** |
-| **`SSDLite (MobileNetV3-Large)`** | Lightweight Edge Mobile CNN *(Zero-Shot)* | `+4.65%` / `+6.82%` | **`-37.21%`** | **`-44.44%`** | **`-20.16%`** |
-| **`Swin-T (Swin Transformer)`** | Hierarchical Vision Transformer *(Zero-Shot)* | `-8.89%` / `-7.46%` | **`-47.01%`** | **`-53.33%`** | **`-38.05%`** |
-| **Trung bình 5 Kiến trúc** | *CNN (2-Stage, 1-Stage, Mobile) + ViT* | **`+0.60%` / `+2.49%`** | **`-39.98%`** | **`-46.95%`** | **`-29.08%`** |
+| **`Faster R-CNN (ResNet50-FPN v2)`** | Two-Stage Anchor Detector *(Teacher)* | `+1.74%` | `+22.55%` | `+23.21%` | `16.18%` / `13.07%` / `8.31%` |
+| **`RetinaNet (ResNet50-FPN v2)`** | One-Stage Focal-Loss Detector *(Zero-Shot)* | `-11.10%` | `+27.85%` | **`-0.92%`** | `10.06%` / `8.29%` / `4.27%` |
+| **`FCOS (ResNet50-FPN)`** | One-Stage Anchor-Free Detector *(Zero-Shot)* | `-1.27%` | `+76.94%` | `+7.16%` | `12.67%` / `10.61%` / `6.03%` |
+| **`SSDLite (MobileNetV3-Large)`** | Edge Mobile Detector *(Zero-Shot)* | `+10.79%` | `+15.66%` | **`-8.85%`** | `7.50%` / `6.66%` / `4.58%` |
+| **`Swin-T (Swin Transformer)`** | Vision Transformer Feature Backbone *(Chỉ đo `FeatSNR`/`Cosine`)* | `+483.04%` | `+20097.76%` | `N/A (Feature-only)` | `N/A (Không phải Detector)` |
+
 
 

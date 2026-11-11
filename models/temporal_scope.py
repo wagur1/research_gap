@@ -184,10 +184,12 @@ class TemporalSCOPE(nn.Module):
             attn_flat, kernel_size=self.qg_size, stride=self.qg_size
         )  # [B*T, 1, H_qg, W_qg]
         mean_attn = qg_attn.mean(dim=(-2, -1), keepdim=True)
-        # Foreground (qg_attn > mean) -> negative Delta-QP (higher quality / lower RDO lambda)
-        # Background (qg_attn < mean) -> positive Delta-QP (coarser quantization / Skip CUs)
-        delta_qp = self.max_delta_qp * (mean_attn - qg_attn)
-        delta_qp = torch.clamp(delta_qp, -self.max_delta_qp, self.max_delta_qp)
+        std_attn = qg_attn.std(dim=(-2, -1), keepdim=True)
+        # Zero-mean spatial contrast across the QG grid: foreground gets negative Delta-QP (finer quantization),
+        # background gets positive Delta-QP (coarser quantization), without shifting average frame bitrate
+        z_score = (mean_attn - qg_attn) / torch.clamp(2.5 * std_attn, min=0.05)
+        delta_qp = self.max_delta_qp * torch.clamp(z_score, -1.0, 1.0)
+        delta_qp = delta_qp - delta_qp.mean(dim=(-2, -1), keepdim=True)
         delta_qp = delta_qp.view(b, t, delta_qp.shape[-2], delta_qp.shape[-1])
 
         if reuse_iframe_across_gop and t > 1:
@@ -237,7 +239,9 @@ class TemporalSCOPE(nn.Module):
         else:
             i_bg_t = i_bg_spatial
 
-        i_edit_t = attn_t * i_obj_t + (1.0 - attn_t) * i_bg_t
+        # Soft-gated foreground preservation: boost learned attention contrast so foreground pixels stay sharp
+        eff_attn_t = torch.clamp(attn_t * 1.35, 0.0, 1.0)
+        i_edit_t = eff_attn_t * i_obj_t + (1.0 - eff_attn_t) * i_bg_t
         return i_edit_t, attn_t, delta_obj_t, delta_bg_t, h_curr, i_bg_t
 
     def forward(

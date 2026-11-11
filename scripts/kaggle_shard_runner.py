@@ -375,7 +375,37 @@ def run_poc_wishlist2_and_eval_shard(args: argparse.Namespace) -> None:
         ckpt = torch.load(args.ckpt, map_location=device)
         model.load_state_dict(ckpt["state_dict"], strict=False)
         print(f"[Eval Shard {args.shard_id}] Loaded trained checkpoint: {args.ckpt}")
+    elif not getattr(args, "allow_untrained", False):
+        raise FileNotFoundError(
+            f"[R15 Gate] Trained checkpoint required for eval_poc but not found: '{args.ckpt}'. "
+            "Pass --allow_untrained only for smoke testing."
+        )
     model.eval()
+
+    # Load dedicated spatial_only_scope checkpoint if available in same folder (R08 fix)
+    spatial_model = TemporalSCOPE(
+        base_ch=48, num_families=4, cond_dim=64, qg_size=16, max_delta_qp=0.0
+    ).to(device)
+    spatial_ckpt_candidates = []
+    if args.ckpt:
+        ckpt_p = Path(args.ckpt)
+        spatial_ckpt_candidates.extend(
+            [
+                ckpt_p.parent / "tscope_soup_spatial_only_scope.pt",
+                ckpt_p.parent / "spatial_scope_autonomous_disjoint.pt",
+            ]
+        )
+        spatial_ckpt_candidates.extend(sorted(ckpt_p.parent.glob("tscope_spatial_only_scope_shard*.pt")))
+    loaded_spatial = False
+    for sck in spatial_ckpt_candidates:
+        if sck.exists():
+            s_state = torch.load(sck, map_location=device)
+            spatial_model.load_state_dict(s_state.get("state_dict", s_state), strict=False)
+            loaded_spatial = True
+            break
+    if not loaded_spatial and args.ckpt and Path(args.ckpt).exists():
+        spatial_model.load_state_dict(model.state_dict(), strict=False)
+    spatial_model.eval()
 
     codec = HybridX265STE(use_real_x265_in_forward=True).to(device)
     fpn_teacher = FrozenFPNDetectorTeacher(pretrained=args.use_pretrained_fpn).to(device)
@@ -397,18 +427,30 @@ def run_poc_wishlist2_and_eval_shard(args: argparse.Namespace) -> None:
             # 1. Baseline Direct Codec (Anchor — Real libx265 bytes via ffprobe)
             base_out = codec.evaluate_real_x265(video, qp, None)
 
-            # 2. Deterministic Blur + Motion-Gated EMA Baseline (Non-learned control, F03 fix)
+            # 2. Deterministic Blur + Motion-Gated EMA Baseline (Non-learned control, F03/R14 fix)
             blur_v = gaussian_blur_5x5(
                 gaussian_blur_5x5(gaussian_blur_5x5(video.view(b * t, 3, h, w)))
             ).view(b, t, 3, h, w)
             dx = torch.nn.functional.pad((video[..., :, 1:] - video[..., :, :-1]).abs(), (0, 1, 0, 0))
             dy = torch.nn.functional.pad((video[..., 1:, :] - video[..., :-1, :]).abs(), (0, 0, 0, 1))
             edge_gate = torch.clamp((dx + dy).mean(dim=2, keepdim=True) * 6.0, 0.0, 1.0)
-            v_det_ema = edge_gate * video + (1.0 - edge_gate) * blur_v[:, 0:1].expand_as(blur_v)
+            ema_frames = []
+            bg_prev = None
+            for step_t in range(t):
+                v_t = video[:, step_t]
+                b_t = blur_v[:, step_t]
+                if step_t > 0 and bg_prev is not None:
+                    diff_mag = (v_t - video[:, step_t - 1]).abs().mean(dim=1, keepdim=True)
+                    static_w = 0.85 * torch.exp(-15.0 * diff_mag)
+                    b_t = static_w * bg_prev + (1.0 - static_w) * b_t
+                bg_prev = b_t
+                e_t = edge_gate[:, step_t]
+                ema_frames.append(e_t * v_t + (1.0 - e_t) * b_t)
+            v_det_ema = torch.stack(ema_frames, dim=1)
             det_ema_out = codec.evaluate_real_x265(v_det_ema, qp, None)
 
-            # 3. Spatial-Only Frame-by-Frame Learned SCOPE (Noise-free, disable_temporal=True, F02/F03 fix)
-            pred_spatial = model(
+            # 3. Spatial-Only Frame-by-Frame Learned SCOPE (Noise-free, disable_temporal=True, F02/F03/R08 fix)
+            pred_spatial = spatial_model(
                 video, fam, sev, reuse_iframe_qp=False, disable_temporal=True
             )
             spatial_out = codec.evaluate_real_x265(pred_spatial["i_edit"], qp, None)
@@ -440,6 +482,11 @@ def run_poc_wishlist2_and_eval_shard(args: argparse.Namespace) -> None:
                 if "gt_boxes" in sample
                 else None
             )
+            ignore_boxes = (
+                sample["ignore_boxes"].unsqueeze(0).to(device)
+                if "ignore_boxes" in sample
+                else None
+            )
 
             for method_name, c_out in [
                 ("anchor_x265", base_out),
@@ -455,7 +502,7 @@ def run_poc_wishlist2_and_eval_shard(args: argparse.Namespace) -> None:
 
                 # Task-region fidelity & Official GT-box AP inside M_det
                 acc_metrics = fpn_teacher.evaluate_task_accuracy(
-                    video, recon, m_det, gt_boxes=gt_boxes
+                    video, recon, m_det, gt_boxes=gt_boxes, ignore_boxes=ignore_boxes
                 )
 
                 shard_records.append(
@@ -503,6 +550,7 @@ def main() -> None:
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--enable_x265_ste", action="store_true")
     parser.add_argument("--use_pretrained_fpn", action="store_true", help="Use torchvision Faster R-CNN ResNet50-FPN v2")
+    parser.add_argument("--allow_untrained", action="store_true", help="Allow eval_poc without a checkpoint for smoke tests")
     args = parser.parse_args()
 
     if args.mode == "train":

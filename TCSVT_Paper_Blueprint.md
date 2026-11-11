@@ -3,6 +3,7 @@
 ## 1. Title Options & Target Venues
 - **Primary Title:** *T-SCOPE: Temporally-Consistent Semantic Pre-Editing and CTU-Level Rate Allocation for Video Coding for Machines*
 - **Alternative Title:** *Bridging Pixel Pre-Editing and In-Codec Rate Control for Standard-Compliant Video Coding for Machines*
+- **Scope Note (`R11` Calibration):** Empirical evaluation in this repository validates standard-compliant **`libx265` (HEVC)** with dynamic per-frame `addroi` $\to$ `x265_picture.quantOffsets` under `crf={27,32,37,42,47}:aq-mode=2` (`IPPP` low-delay). Theoretical references to the Data Processing Inequality (DPI) / Information Bottleneck (Bajić 2025) serve as design motivation rather than formal mutual-information proofs, and cross-codec transfer to `VVenC` (H.266/VVC) is designated as planned journal extension work.
 - **Target Venues:**
   1. **IEEE Transactions on Circuits and Systems for Video Technology (TCSVT)** (Q1, IF ~8.4) — Best fit; direct successor to Lu et al. (TCSVT 2024) and Yang et al. (TCSVT 2024).
   2. **IEEE Transactions on Image Processing (TIP)** (Q1, IF ~10.8) — Strong fit if theoretical Rate-Accuracy / Information Bottleneck analysis (building on Bajić 2025) is emphasized.
@@ -102,7 +103,7 @@ $$\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{task}} + \mathcal{L}_{\text{at
     3. Zhao et al. (DCC 2024 Video Preprocessor)
     4. SCOPE (2026, applied frame-by-frame)
     5. **T-SCOPE (Ours)**
-  - **Table II (Zero-Shot Cross-Codec Transfer to VVC / `VVenC` and `x264`):** Evaluate the `x265`-trained T-SCOPE directly on `VVenC` (H.266/VVC) and `x264` without retraining. Show that `x265` + T-SCOPE matches or beats vanilla `VVenC` anchor (bridging the codec generation gap like WA-RDO) while running $5\times$–$10\times$ faster than VVC encoding.
+  - **Table II (Zero-Shot Cross-Detector Transfer on Real `libx265` & Planned Cross-Codec Extension):** Evaluate the Faster R-CNN-trained T-SCOPE zero-shot across 4 distinct object detectors (`Faster R-CNN`, `RetinaNet`, `FCOS`, `SSDLite`) using official dataset-level COCO/VOC AP on held-out `MOT17` sequences (`scripts/eval_cross_backbone_bdbr.py`), and report feature-space SNR on `Swin-T` separately. Cross-codec evaluation on `VVenC` (H.266/VVC) is reserved as future extension.
   - **Table III (Ablation Study on `x265`):**
     - Row 1: Direct `x265` (0.0% BDBR)
     - Row 2: Spatial Pre-Edit only (SCOPE baseline on video) $\to$ saves Intra bits, hurts P-frame ME

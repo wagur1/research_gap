@@ -41,16 +41,22 @@ def get_shard_slice(items: List[Any], shard_id: int, num_shards: int) -> List[An
     return [item for idx, item in enumerate(items) if idx % num_shards == shard_id]
 
 
-def parse_mot_gt_file(gt_path: Path) -> Dict[int, List[Tuple[float, float, float, float]]]:
+def parse_mot_gt_file(
+    gt_path: Path,
+) -> Tuple[Dict[int, List[Tuple[float, float, float, float]]], Dict[int, List[Tuple[float, float, float, float]]]]:
     """
-    Parses MOT17 / MOT20 ground-truth file `gt/gt.txt`.
+    Parses MOT17 / MOT20 ground-truth file `gt/gt.txt` following official MOTChallenge protocol (R04 fix).
     Format per line: frame_id, track_id, x, y, w, h, mark, class_id, visibility
+      - Active pedestrian targets: `mark == 1 and class_id == 1` (Pedestrian).
+      - Ignore / distractor regions: `mark == 0 or class_id in (2, 7, 8, 12)` (Person on vehicle, static person, distractor, reflection).
+      - Non-person vehicle/object classes (`class_id in (3, 4, 5, 6, 9, 10, 11)`) are excluded.
     Returns:
-        Dict mapping 1-based frame_id -> list of (x1, y1, x2, y2) bounding boxes.
+        (active_boxes_by_frame, ignore_boxes_by_frame) mapping 1-based frame_id -> list of (x1, y1, x2, y2).
     """
-    frame_boxes: Dict[int, List[Tuple[float, float, float, float]]] = {}
+    active_boxes: Dict[int, List[Tuple[float, float, float, float]]] = {}
+    ignore_boxes: Dict[int, List[Tuple[float, float, float, float]]] = {}
     if not gt_path.exists():
-        return frame_boxes
+        return active_boxes, ignore_boxes
 
     with open(gt_path, "r", encoding="utf-8") as f:
         for line in f:
@@ -61,14 +67,17 @@ def parse_mot_gt_file(gt_path: Path) -> Dict[int, List[Tuple[float, float, float
             x, y, w, h = float(parts[2]), float(parts[3]), float(parts[4]), float(parts[5])
             if w <= 1.0 or h <= 1.0:
                 continue
-            # If MOT17 mark/class_id columns exist, filter out ignored regions (class_id in {1,2,7} are active targets)
+            box = (x, y, x + w, y + h)
             if len(parts) >= 8:
                 mark = int(float(parts[6]))
                 cls_id = int(float(parts[7]))
-                if mark == 0 or cls_id not in (1, 2, 3, 4, 5, 6, 7):
-                    continue
-            frame_boxes.setdefault(frame_id, []).append((x, y, x + w, y + h))
-    return frame_boxes
+                if mark == 1 and cls_id == 1:
+                    active_boxes.setdefault(frame_id, []).append(box)
+                elif mark == 0 or cls_id in (2, 7, 8, 12):
+                    ignore_boxes.setdefault(frame_id, []).append(box)
+            else:
+                active_boxes.setdefault(frame_id, []).append(box)
+    return active_boxes, ignore_boxes
 
 
 def parse_yolo_label_file(
@@ -236,7 +245,7 @@ class RealVCMVideoDataset(Dataset):
             gt_path = seq_dir / "gt" / "gt.txt"
             if not gt_path.exists():
                 continue
-            gt_map = parse_mot_gt_file(gt_path)
+            gt_map, ignore_map = parse_mot_gt_file(gt_path)
             frames = sorted(img1_dir.glob("*.jpg")) + sorted(img1_dir.glob("*.png"))
             for start in range(0, len(frames) - self.clip_len + 1, self.stride):
                 clips.append(
@@ -245,6 +254,7 @@ class RealVCMVideoDataset(Dataset):
                         "seq_name": seq_dir.name,
                         "frame_paths": frames[start : start + self.clip_len],
                         "gt_map": gt_map,
+                        "ignore_map": ignore_map,
                     }
                 )
 
@@ -280,16 +290,44 @@ class RealVCMVideoDataset(Dataset):
         return len(self.clips)
 
     @staticmethod
-    def _pack_boxes_tensor(boxes_list: List[torch.Tensor], max_boxes: int = 64) -> torch.Tensor:
-        """Pads variable-length per-frame boxes into a fixed [T, max_boxes, 4] tensor (-1 padded)."""
+    def _pack_boxes_tensor(boxes_list: List[torch.Tensor], max_boxes: int = 256) -> torch.Tensor:
+        """Pads variable-length per-frame boxes into a fixed [T, max_boxes, 4] tensor (-1 padded, never silently truncates)."""
         t = len(boxes_list)
         out = torch.full((t, max_boxes, 4), -1.0, dtype=torch.float32)
         for f_idx, b_t in enumerate(boxes_list):
             if b_t.numel() == 0:
                 continue
-            n = min(max_boxes, b_t.shape[0])
+            if b_t.shape[0] > max_boxes:
+                raise RuntimeError(f"Frame has {b_t.shape[0]} boxes exceeding max_boxes={max_boxes}")
+            n = b_t.shape[0]
             out[f_idx, :n] = b_t[:n]
         return out
+
+    @staticmethod
+    def _transform_boxes_list(
+        raw_boxes_per_frame: List[List[Tuple[float, float, float, float]]],
+        target: int,
+        sx: float = 1.0,
+        sy: float = 1.0,
+        x0: float = 0.0,
+        y0: float = 0.0,
+    ) -> torch.Tensor:
+        out_boxes: List[torch.Tensor] = []
+        for f_boxes in raw_boxes_per_frame:
+            valid = []
+            for x1, y1, x2, y2 in f_boxes:
+                nx1 = max(0.0, min(float(target), (x1 - x0) * sx))
+                ny1 = max(0.0, min(float(target), (y1 - y0) * sy))
+                nx2 = max(0.0, min(float(target), (x2 - x0) * sx))
+                ny2 = max(0.0, min(float(target), (y2 - y0) * sy))
+                if (nx2 - nx1) >= 2.0 and (ny2 - ny1) >= 2.0:
+                    valid.append([nx1, ny1, nx2, ny2])
+            out_boxes.append(
+                torch.tensor(valid, dtype=torch.float32)
+                if valid
+                else torch.zeros((0, 4), dtype=torch.float32)
+            )
+        return RealVCMVideoDataset._pack_boxes_tensor(out_boxes)
 
     def _crop_or_resize_clip(
         self,
@@ -297,12 +335,13 @@ class RealVCMVideoDataset(Dataset):
         m_attn: torch.Tensor,
         m_det: torch.Tensor,
         raw_boxes_per_frame: List[List[Tuple[float, float, float, float]]],
+        raw_ignore_per_frame: List[List[Tuple[float, float, float, float]]],
         clip_idx: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Object-centered crop of size `img_size x img_size` (divisible by 16 for x265 QG/CTU)
-        during training (matching SCOPE Sec. 3.2), or resize during eval, and transforms
-        ground-truth bounding boxes `raw_boxes_per_frame` into exact coordinates on the output frame.
+        during training (matching SCOPE Sec. 3.2), or resize during eval, and transforms both
+        active pedestrian ground-truth boxes and MOT17 ignore regions into output coordinates.
         """
         t, c, h, w = video.shape
         target = (self.img_size // 16) * 16
@@ -312,22 +351,13 @@ class RealVCMVideoDataset(Dataset):
             ma_out = F.interpolate(m_attn, size=(target, target), mode="nearest")
             md_out = F.interpolate(m_det, size=(target, target), mode="nearest")
             sx, sy = float(target) / float(w), float(target) / float(h)
-            scaled_boxes: List[torch.Tensor] = []
-            for f_boxes in raw_boxes_per_frame:
-                valid = []
-                for x1, y1, x2, y2 in f_boxes:
-                    nx1 = max(0.0, min(float(target), x1 * sx))
-                    ny1 = max(0.0, min(float(target), y1 * sy))
-                    nx2 = max(0.0, min(float(target), x2 * sx))
-                    ny2 = max(0.0, min(float(target), y2 * sy))
-                    if (nx2 - nx1) >= 2.0 and (ny2 - ny1) >= 2.0:
-                        valid.append([nx1, ny1, nx2, ny2])
-                scaled_boxes.append(
-                    torch.tensor(valid, dtype=torch.float32)
-                    if valid
-                    else torch.zeros((0, 4), dtype=torch.float32)
-                )
-            return v_out, ma_out, md_out, self._pack_boxes_tensor(scaled_boxes)
+            return (
+                v_out,
+                ma_out,
+                md_out,
+                self._transform_boxes_list(raw_boxes_per_frame, target, sx=sx, sy=sy),
+                self._transform_boxes_list(raw_ignore_per_frame, target, sx=sx, sy=sy),
+            )
 
         # Find object center from m_attn on first frame if available
         ys, xs = torch.where(m_attn[0, 0] > 0.5)
@@ -341,51 +371,43 @@ class RealVCMVideoDataset(Dataset):
             y0 = int(torch.randint(0, h - target + 1, (1,), generator=g).item())
             x0 = int(torch.randint(0, w - target + 1, (1,), generator=g).item())
 
-        cropped_boxes: List[torch.Tensor] = []
-        for f_boxes in raw_boxes_per_frame:
-            valid = []
-            for x1, y1, x2, y2 in f_boxes:
-                nx1 = max(0.0, min(float(target), x1 - x0))
-                ny1 = max(0.0, min(float(target), y1 - y0))
-                nx2 = max(0.0, min(float(target), x2 - x0))
-                ny2 = max(0.0, min(float(target), y2 - y0))
-                if (nx2 - nx1) >= 2.0 and (ny2 - ny1) >= 2.0:
-                    valid.append([nx1, ny1, nx2, ny2])
-            cropped_boxes.append(
-                torch.tensor(valid, dtype=torch.float32)
-                if valid
-                else torch.zeros((0, 4), dtype=torch.float32)
-            )
-
         return (
             video[:, :, y0 : y0 + target, x0 : x0 + target],
             m_attn[:, :, y0 : y0 + target, x0 : x0 + target],
             m_det[:, :, y0 : y0 + target, x0 : x0 + target],
-            self._pack_boxes_tensor(cropped_boxes),
+            self._transform_boxes_list(raw_boxes_per_frame, target, x0=float(x0), y0=float(y0)),
+            self._transform_boxes_list(raw_ignore_per_frame, target, x0=float(x0), y0=float(y0)),
         )
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         meta = self.clips[idx]
         frames_t, mattn_t, mdet_t = [], [], []
         raw_boxes_per_frame: List[List[Tuple[float, float, float, float]]] = []
+        raw_ignore_per_frame: List[List[Tuple[float, float, float, float]]] = []
+        has_annotation_source = False
 
         if meta["type"] == "mot_frames":
+            has_annotation_source = True
             gt_map = meta["gt_map"]
+            ignore_map = meta.get("ignore_map", {})
             for fpath in meta["frame_paths"]:
                 frame_num = int(re.sub(r"\D", "", fpath.stem) or "1")
                 img = Image.open(fpath).convert("RGB")
                 w, h = img.size
                 tensor_img = torch.from_numpy(np.array(img, dtype=np.float32) / 255.0).permute(2, 0, 1)
                 boxes = gt_map.get(frame_num, [])
+                ig_boxes = ignore_map.get(frame_num, [])
                 ma, md = boxes_to_masks(boxes, h, w, context_pad=16)
                 frames_t.append(tensor_img)
                 mattn_t.append(ma)
                 mdet_t.append(md)
                 raw_boxes_per_frame.append(boxes)
+                raw_ignore_per_frame.append(ig_boxes)
 
         elif meta["type"] == "sfu_yuv":
             w, h = meta["width"], meta["height"]
             start_f = meta["start_frame"]
+            has_annotation_source = meta["label_dir"].exists()
             for offset in range(self.clip_len):
                 f_idx = start_f + offset
                 tensor_img = read_raw_yuv420_frame(meta["yuv_path"], w, h, f_idx)
@@ -396,25 +418,27 @@ class RealVCMVideoDataset(Dataset):
                 mattn_t.append(ma)
                 mdet_t.append(md)
                 raw_boxes_per_frame.append(boxes)
+                raw_ignore_per_frame.append([])
 
         video = torch.stack(frames_t, dim=0)  # [T, 3, H, W]
         m_attn = torch.stack(mattn_t, dim=0)  # [T, 1, H, W]
         m_det = torch.stack(mdet_t, dim=0)  # [T, 1, H, W]
 
-        # If no GT boxes were present in an unlabeled sequence, fallback to center ROI
-        if m_det.sum() == 0:
+        # Only synthesize center ROI if the sequence has NO annotation source at all (R04 fix: never invent fake ROI on empty labeled frames)
+        if not has_annotation_source and m_det.sum() == 0:
             _, _, h_v, w_v = video.shape
             m_attn[:, :, h_v // 4 : 3 * h_v // 4, w_v // 4 : 3 * w_v // 4] = 1.0
             m_det[:, :, h_v // 5 : 4 * h_v // 5, w_v // 5 : 4 * w_v // 5] = 1.0
 
-        video, m_attn, m_det, gt_boxes = self._crop_or_resize_clip(
-            video, m_attn, m_det, raw_boxes_per_frame, idx
+        video, m_attn, m_det, gt_boxes, ignore_boxes = self._crop_or_resize_clip(
+            video, m_attn, m_det, raw_boxes_per_frame, raw_ignore_per_frame, idx
         )
         return {
             "video": video,
             "m_attn": m_attn,
             "m_det": m_det,
             "gt_boxes": gt_boxes,
+            "ignore_boxes": ignore_boxes,
             "clip_id": torch.tensor(idx, dtype=torch.long),
             "seq_name": meta["seq_name"],
         }

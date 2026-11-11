@@ -113,8 +113,13 @@ class DifferentiableVideoProxy(nn.Module):
         for step in range(t):
             if ctu_qp_offsets is not None:
                 d_qp = ctu_qp_offsets[:, step].unsqueeze(1)  # [B, 1, H_qg, W_qg]
+                # Match the 8x8 macro-CTU resolution of the real ffmpeg addroi filtergraph (R05 fix)
+                gh, gw = min(8, h // 16), min(8, w // 16)
+                d_qp_macro = F.interpolate(
+                    d_qp, size=(gh, gw), mode="bilinear", align_corners=False
+                )
                 d_qp_8x8 = F.interpolate(
-                    d_qp, size=(num_blocks_h, num_blocks_w), mode="nearest"
+                    d_qp_macro, size=(num_blocks_h, num_blocks_w), mode="nearest"
                 )
             else:
                 d_qp_8x8 = torch.zeros(
@@ -173,47 +178,72 @@ class HybridX265STE(nn.Module):
         ctu_qp_offsets: Optional[torch.Tensor], h: int, w: int
     ) -> List[str]:
         """
-        Converts spatial CTU Delta-QP tensor [T, H_qg, W_qg] (or [H_qg, W_qg]) in [-6, +6]
-        into an ffmpeg `-vf addroi=...` filter chain. Inside ffmpeg (`libavcodec/libx265.c`),
-        `AV_FRAME_DATA_REGIONS_OF_INTEREST` is mapped directly into `x265_picture.quantOffsets`.
+        Converts dynamic per-frame spatial CTU Delta-QP tensor [T, H_qg, W_qg] (or [H_qg, W_qg])
+        in [-6, +6] into an exact per-frame ffmpeg `-vf split=T...;select='eq(n,t)',addroi=...;interleave=n=T`
+        filtergraph (R05 fix: never averages `ctu_qp_offsets` across time `t`, so each frame `t`
+        receives its own dynamic `AV_FRAME_DATA_REGIONS_OF_INTEREST` -> `x265_picture.quantOffsets`).
         """
         if ctu_qp_offsets is None:
             return []
-        if ctu_qp_offsets.dim() == 3:
-            # Temporal average over the short GOP or I-frame map [H_qg, W_qg]
-            grid = ctu_qp_offsets.detach().mean(dim=0, keepdim=True).unsqueeze(0)
-        elif ctu_qp_offsets.dim() == 2:
-            grid = ctu_qp_offsets.detach().unsqueeze(0).unsqueeze(0)
+        if ctu_qp_offsets.dim() == 2:
+            grid_t = ctu_qp_offsets.detach().unsqueeze(0).unsqueeze(1)  # [1, 1, H_qg, W_qg]
+        elif ctu_qp_offsets.dim() == 3:
+            grid_t = ctu_qp_offsets.detach().unsqueeze(1)  # [T, 1, H_qg, W_qg]
         else:
             return []
 
-        if float(grid.abs().max().item()) < 1e-4:
+        if float(grid_t.abs().max().item()) < 1e-4:
             return []
 
-        # Coarsen to 8x8 spatial macro-CTU regions for fast ffmpeg filter parsing
+        t_frames = grid_t.shape[0]
         gh, gw = min(8, h // 16), min(8, w // 16)
-        grid_8x8 = F.interpolate(grid, size=(gh, gw), mode="bilinear", align_corners=False)[0, 0]
+        grid_8x8 = F.interpolate(grid_t, size=(gh, gw), mode="bilinear", align_corners=False)[:, 0]  # [T, gh, gw]
         cell_h, cell_w = h // gh, w // gw
 
-        rois: List[str] = []
-        for r in range(gh):
-            for c in range(gw):
-                d_qp = float(grid_8x8[r, c].item())
-                if abs(d_qp) < 0.15:
-                    continue
-                # In ffmpeg addroi, qoffset in [-1, 1] scales quantizer range (51 QP steps in HEVC)
-                qoff = max(-0.30, min(0.30, d_qp / 51.0))
-                y0, x0 = r * cell_h, c * cell_w
-                bh = (h - y0) if r == gh - 1 else cell_h
-                bw = (w - x0) if c == gw - 1 else cell_w
-                clear_flag = 1 if len(rois) == 0 else 0
-                rois.append(
-                    f"addroi=x={x0}:y={y0}:w={bw}:h={bh}:qoffset={qoff:.5f}:clear={clear_flag}"
-                )
+        def build_frame_rois(frame_grid: torch.Tensor) -> List[str]:
+            rois: List[str] = []
+            for r in range(gh):
+                for c in range(gw):
+                    d_qp = float(frame_grid[r, c].item())
+                    if abs(d_qp) < 0.15:
+                        continue
+                    # In ffmpeg addroi, qoffset in [-1, 1] scales quantizer range (51 QP steps in HEVC).
+                    # Cap positive background coarsening at +0.06 (+3 QP) so overall bitrate does not collapse,
+                    # while allowing up to -0.18 (-9 QP) for high-importance foreground ROI blocks.
+                    qoff = max(-0.18, min(0.06, d_qp / 51.0))
+                    y0, x0 = r * cell_h, c * cell_w
+                    bh = (h - y0) if r == gh - 1 else cell_h
+                    bw = (w - x0) if c == gw - 1 else cell_w
+                    clear_flag = 1 if len(rois) == 0 else 0
+                    rois.append(
+                        f"addroi=x={x0}:y={y0}:w={bw}:h={bh}:qoffset={qoff:.5f}:clear={clear_flag}"
+                    )
+            return rois
 
-        if not rois:
+        # Check if all T frames share an identical map (e.g., t=1 or iwa_gop_qp_reuse)
+        all_same = t_frames == 1 or bool((grid_8x8 - grid_8x8[0:1]).abs().max().item() < 1e-5)
+        if all_same:
+            rois_0 = build_frame_rois(grid_8x8[0])
+            return ["-vf", ",".join(rois_0)] if rois_0 else []
+
+        # Build exact per-frame dynamic ROI filtergraph via split + select + addroi + interleave
+        split_pads = "".join(f"[s{i}]" for i in range(t_frames))
+        branches: List[str] = [f"split={t_frames}{split_pads}"]
+        out_pads = "".join(f"[v{i}]" for i in range(t_frames))
+        any_roi = False
+        for i in range(t_frames):
+            f_rois = build_frame_rois(grid_8x8[i])
+            if f_rois:
+                any_roi = True
+                chain = ",".join([f"select='eq(n,{i})'"] + f_rois)
+            else:
+                chain = f"select='eq(n,{i})'"
+            branches.append(f"[s{i}]{chain}[v{i}]")
+
+        if not any_roi:
             return []
-        return ["-vf", ",".join(rois)]
+        branches.append(f"{out_pads}interleave=n={t_frames}")
+        return ["-vf", ";".join(branches)]
 
     @torch.no_grad()
     def encode_decode_x265_clip(
@@ -301,10 +331,17 @@ class HybridX265STE(nn.Module):
 
             frame_bpps_list: List[float] = []
             frame_types: List[str] = []
-            for pf in probe_frames:
-                pkt_bytes = int(pf.get("pkt_size", 0))
+            for pf_idx, pf in enumerate(probe_frames):
+                if "pkt_size" not in pf or "pict_type" not in pf:
+                    raise RuntimeError(f"ffprobe frame {pf_idx} missing pkt_size or pict_type: {pf}")
+                pkt_bytes = int(pf["pkt_size"])
+                pict_t = str(pf["pict_type"]).strip()
+                if pkt_bytes <= 0:
+                    raise RuntimeError(f"ffprobe frame {pf_idx} returned non-positive pkt_size={pkt_bytes}")
+                if pict_t not in ("I", "P", "B"):
+                    raise RuntimeError(f"ffprobe frame {pf_idx} returned invalid pict_type={pict_t}")
                 frame_bpps_list.append((pkt_bytes * 8.0) / float(h * w))
-                frame_types.append(str(pf.get("pict_type", "P")))
+                frame_types.append(pict_t)
 
             cmd_dec = [
                 "ffmpeg",
@@ -365,15 +402,23 @@ class HybridX265STE(nn.Module):
 
         video_recon = torch.stack(recons, dim=0)
         rate_per_frame = torch.stack(frame_rate_rows, dim=0)  # [B, T]
+        i_rates: List[float] = []
+        p_rates: List[float] = []
+        for b_i, f_types in enumerate(all_types):
+            for t_i, ft in enumerate(f_types):
+                val = float(rate_per_frame[b_i, t_i].item())
+                if ft == "I":
+                    i_rates.append(val)
+                elif ft in ("P", "B"):
+                    p_rates.append(val)
         return {
             "video_recon": video_recon,
             "rate_per_frame": rate_per_frame,
             "total_bpp": float(rate_per_frame.mean().item()),
-            "i_frame_bpp": float(rate_per_frame[:, 0].mean().item()),
-            "p_frame_bpp": float(rate_per_frame[:, 1:].mean().item())
-            if rate_per_frame.shape[1] > 1
-            else float(rate_per_frame[:, 0].mean().item()),
+            "i_frame_bpp": float(np.mean(i_rates)) if i_rates else float("nan"),
+            "p_frame_bpp": float(np.mean(p_rates)) if p_rates else float("nan"),
             "frame_types": all_types[0] if all_types else [],
+            "rate_control_mode": f"crf={qp}:aq-mode=2:bframes=0:keyint={video_edit.shape[1]}",
         }
 
     def forward(
