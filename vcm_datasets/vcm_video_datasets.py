@@ -176,6 +176,11 @@ def read_raw_yuv420_frame(
     return torch.from_numpy(rgb.astype(np.float32))
 
 
+# Official Disjoint Train / Held-Out Test Split on MOT17 (Gate 1 / F08 fix)
+MOT17_TRAIN_PREFIXES = ("MOT17-02", "MOT17-04", "MOT17-05", "MOT17-09", "MOT17-10")
+MOT17_TEST_PREFIXES = ("MOT17-11", "MOT17-13")
+
+
 class RealVCMVideoDataset(Dataset):
     """
     Unified Sharded Dataset for MOT17, SFU-HW-Objects-v1, and BDD100K-MOT.
@@ -184,6 +189,9 @@ class RealVCMVideoDataset(Dataset):
       - SFU-HW structure: `data_root/**/*.yuv` + `labels/<seq>_<frame>.txt`
       - Generic image sequence structure: `data_root/<seq>/*.jpg|png`
     Slices all discovered multi-frame clips across `num_shards` Kaggle accounts.
+    When `enforce_disjoint_split=True`, strictly separates MOT17 sequences into:
+      - Train sequences: MOT17-02, MOT17-04, MOT17-05, MOT17-09, MOT17-10
+      - Held-Out Test sequences: MOT17-11 (moving street camera), MOT17-13 (moving bus camera)
     """
 
     def __init__(
@@ -195,6 +203,7 @@ class RealVCMVideoDataset(Dataset):
         stride: int = 4,
         img_size: int = 512,
         is_train: bool = True,
+        enforce_disjoint_split: bool = False,
     ) -> None:
         super().__init__()
         self.data_root = Path(data_root) if data_root else None
@@ -202,6 +211,7 @@ class RealVCMVideoDataset(Dataset):
         self.stride = stride
         self.img_size = img_size
         self.is_train = is_train
+        self.enforce_disjoint_split = enforce_disjoint_split
 
         all_clips = self._discover_clips()
         self.clips = get_shard_slice(all_clips, shard_id, num_shards)
@@ -219,6 +229,10 @@ class RealVCMVideoDataset(Dataset):
             # MOT17 has duplicate folders for SDP/FRCNN/DPM; keep only one copy per video sequence
             if any(tag in seq_dir.name for tag in ("-SDP", "-DPM")):
                 continue
+            if self.enforce_disjoint_split and seq_dir.name.startswith("MOT17-"):
+                allowed = MOT17_TRAIN_PREFIXES if self.is_train else MOT17_TEST_PREFIXES
+                if not any(seq_dir.name.startswith(p) for p in allowed):
+                    continue
             gt_path = seq_dir / "gt" / "gt.txt"
             if not gt_path.exists():
                 continue
@@ -265,16 +279,30 @@ class RealVCMVideoDataset(Dataset):
     def __len__(self) -> int:
         return len(self.clips)
 
+    @staticmethod
+    def _pack_boxes_tensor(boxes_list: List[torch.Tensor], max_boxes: int = 64) -> torch.Tensor:
+        """Pads variable-length per-frame boxes into a fixed [T, max_boxes, 4] tensor (-1 padded)."""
+        t = len(boxes_list)
+        out = torch.full((t, max_boxes, 4), -1.0, dtype=torch.float32)
+        for f_idx, b_t in enumerate(boxes_list):
+            if b_t.numel() == 0:
+                continue
+            n = min(max_boxes, b_t.shape[0])
+            out[f_idx, :n] = b_t[:n]
+        return out
+
     def _crop_or_resize_clip(
         self,
         video: torch.Tensor,
         m_attn: torch.Tensor,
         m_det: torch.Tensor,
+        raw_boxes_per_frame: List[List[Tuple[float, float, float, float]]],
         clip_idx: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Object-centered crop of size `img_size x img_size` (divisible by 16 for x265 QG/CTU)
-        during training (matching SCOPE Sec. 3.2), or aspect-preserving resize during eval.
+        during training (matching SCOPE Sec. 3.2), or resize during eval, and transforms
+        ground-truth bounding boxes `raw_boxes_per_frame` into exact coordinates on the output frame.
         """
         t, c, h, w = video.shape
         target = (self.img_size // 16) * 16
@@ -283,7 +311,23 @@ class RealVCMVideoDataset(Dataset):
             v_out = F.interpolate(video, size=(target, target), mode="bilinear", align_corners=False)
             ma_out = F.interpolate(m_attn, size=(target, target), mode="nearest")
             md_out = F.interpolate(m_det, size=(target, target), mode="nearest")
-            return v_out, ma_out, md_out
+            sx, sy = float(target) / float(w), float(target) / float(h)
+            scaled_boxes: List[torch.Tensor] = []
+            for f_boxes in raw_boxes_per_frame:
+                valid = []
+                for x1, y1, x2, y2 in f_boxes:
+                    nx1 = max(0.0, min(float(target), x1 * sx))
+                    ny1 = max(0.0, min(float(target), y1 * sy))
+                    nx2 = max(0.0, min(float(target), x2 * sx))
+                    ny2 = max(0.0, min(float(target), y2 * sy))
+                    if (nx2 - nx1) >= 2.0 and (ny2 - ny1) >= 2.0:
+                        valid.append([nx1, ny1, nx2, ny2])
+                scaled_boxes.append(
+                    torch.tensor(valid, dtype=torch.float32)
+                    if valid
+                    else torch.zeros((0, 4), dtype=torch.float32)
+                )
+            return v_out, ma_out, md_out, self._pack_boxes_tensor(scaled_boxes)
 
         # Find object center from m_attn on first frame if available
         ys, xs = torch.where(m_attn[0, 0] > 0.5)
@@ -297,15 +341,33 @@ class RealVCMVideoDataset(Dataset):
             y0 = int(torch.randint(0, h - target + 1, (1,), generator=g).item())
             x0 = int(torch.randint(0, w - target + 1, (1,), generator=g).item())
 
+        cropped_boxes: List[torch.Tensor] = []
+        for f_boxes in raw_boxes_per_frame:
+            valid = []
+            for x1, y1, x2, y2 in f_boxes:
+                nx1 = max(0.0, min(float(target), x1 - x0))
+                ny1 = max(0.0, min(float(target), y1 - y0))
+                nx2 = max(0.0, min(float(target), x2 - x0))
+                ny2 = max(0.0, min(float(target), y2 - y0))
+                if (nx2 - nx1) >= 2.0 and (ny2 - ny1) >= 2.0:
+                    valid.append([nx1, ny1, nx2, ny2])
+            cropped_boxes.append(
+                torch.tensor(valid, dtype=torch.float32)
+                if valid
+                else torch.zeros((0, 4), dtype=torch.float32)
+            )
+
         return (
             video[:, :, y0 : y0 + target, x0 : x0 + target],
             m_attn[:, :, y0 : y0 + target, x0 : x0 + target],
             m_det[:, :, y0 : y0 + target, x0 : x0 + target],
+            self._pack_boxes_tensor(cropped_boxes),
         )
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         meta = self.clips[idx]
         frames_t, mattn_t, mdet_t = [], [], []
+        raw_boxes_per_frame: List[List[Tuple[float, float, float, float]]] = []
 
         if meta["type"] == "mot_frames":
             gt_map = meta["gt_map"]
@@ -319,6 +381,7 @@ class RealVCMVideoDataset(Dataset):
                 frames_t.append(tensor_img)
                 mattn_t.append(ma)
                 mdet_t.append(md)
+                raw_boxes_per_frame.append(boxes)
 
         elif meta["type"] == "sfu_yuv":
             w, h = meta["width"], meta["height"]
@@ -332,6 +395,7 @@ class RealVCMVideoDataset(Dataset):
                 frames_t.append(tensor_img)
                 mattn_t.append(ma)
                 mdet_t.append(md)
+                raw_boxes_per_frame.append(boxes)
 
         video = torch.stack(frames_t, dim=0)  # [T, 3, H, W]
         m_attn = torch.stack(mattn_t, dim=0)  # [T, 1, H, W]
@@ -343,11 +407,14 @@ class RealVCMVideoDataset(Dataset):
             m_attn[:, :, h_v // 4 : 3 * h_v // 4, w_v // 4 : 3 * w_v // 4] = 1.0
             m_det[:, :, h_v // 5 : 4 * h_v // 5, w_v // 5 : 4 * w_v // 5] = 1.0
 
-        video, m_attn, m_det = self._crop_or_resize_clip(video, m_attn, m_det, idx)
+        video, m_attn, m_det, gt_boxes = self._crop_or_resize_clip(
+            video, m_attn, m_det, raw_boxes_per_frame, idx
+        )
         return {
             "video": video,
             "m_attn": m_attn,
             "m_det": m_det,
+            "gt_boxes": gt_boxes,
             "clip_id": torch.tensor(idx, dtype=torch.long),
             "seq_name": meta["seq_name"],
         }

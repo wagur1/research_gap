@@ -1,9 +1,10 @@
+import json
 import math
 import shutil
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -167,47 +168,213 @@ class HybridX265STE(nn.Module):
         self.use_real_x265 = use_real_x265_in_forward and (shutil.which("ffmpeg") is not None)
         self.preset = preset
 
+    @staticmethod
+    def _build_addroi_filter_from_offsets(
+        ctu_qp_offsets: Optional[torch.Tensor], h: int, w: int
+    ) -> List[str]:
+        """
+        Converts spatial CTU Delta-QP tensor [T, H_qg, W_qg] (or [H_qg, W_qg]) in [-6, +6]
+        into an ffmpeg `-vf addroi=...` filter chain. Inside ffmpeg (`libavcodec/libx265.c`),
+        `AV_FRAME_DATA_REGIONS_OF_INTEREST` is mapped directly into `x265_picture.quantOffsets`.
+        """
+        if ctu_qp_offsets is None:
+            return []
+        if ctu_qp_offsets.dim() == 3:
+            # Temporal average over the short GOP or I-frame map [H_qg, W_qg]
+            grid = ctu_qp_offsets.detach().mean(dim=0, keepdim=True).unsqueeze(0)
+        elif ctu_qp_offsets.dim() == 2:
+            grid = ctu_qp_offsets.detach().unsqueeze(0).unsqueeze(0)
+        else:
+            return []
+
+        if float(grid.abs().max().item()) < 1e-4:
+            return []
+
+        # Coarsen to 8x8 spatial macro-CTU regions for fast ffmpeg filter parsing
+        gh, gw = min(8, h // 16), min(8, w // 16)
+        grid_8x8 = F.interpolate(grid, size=(gh, gw), mode="bilinear", align_corners=False)[0, 0]
+        cell_h, cell_w = h // gh, w // gw
+
+        rois: List[str] = []
+        for r in range(gh):
+            for c in range(gw):
+                d_qp = float(grid_8x8[r, c].item())
+                if abs(d_qp) < 0.15:
+                    continue
+                # In ffmpeg addroi, qoffset in [-1, 1] scales quantizer range (51 QP steps in HEVC)
+                qoff = max(-0.30, min(0.30, d_qp / 51.0))
+                y0, x0 = r * cell_h, c * cell_w
+                bh = (h - y0) if r == gh - 1 else cell_h
+                bw = (w - x0) if c == gw - 1 else cell_w
+                clear_flag = 1 if len(rois) == 0 else 0
+                rois.append(
+                    f"addroi=x={x0}:y={y0}:w={bw}:h={bh}:qoffset={qoff:.5f}:clear={clear_flag}"
+                )
+
+        if not rois:
+            return []
+        return ["-vf", ",".join(rois)]
+
     @torch.no_grad()
     def encode_decode_x265_clip(
-        self, clip: torch.Tensor, qp: int
-    ) -> Tuple[torch.Tensor, float]:
+        self,
+        clip: torch.Tensor,
+        qp: int,
+        ctu_qp_offsets: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, float, torch.Tensor, List[str]]:
         """
-        Encodes a single clip [T, 3, H, W] in [0, 1] using real x265 via ffmpeg pipe/tempfiles
-        and returns reconstructed clip [T, 3, H, W] and exact bits-per-pixel (bpp).
+        Encodes a single clip [T, 3, H, W] in [0, 1] using REAL `libx265` via ffmpeg,
+        applies CTU/ROI quantOffsets via `addroi`, and extracts exact per-frame entropy-coded
+        stream bytes (`pkt_size`) and frame types (`I`/`P`) via `ffprobe`.
+        Fails closed if `ffmpeg` or `ffprobe` is missing or returns an error.
         """
+        if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
+            raise RuntimeError("Real x265 evaluation requires both `ffmpeg` and `ffprobe` in PATH.")
+
         t, _, h, w = clip.shape
-        frames_np = (clip.permute(0, 2, 3, 1).cpu().numpy() * 255.0).round().astype(np.uint8)
+        frames_np = (
+            torch.clamp(clip, 0.0, 1.0).permute(0, 2, 3, 1).cpu().numpy() * 255.0
+        ).round().astype(np.uint8)
+
+        vf_args = self._build_addroi_filter_from_mask_or_offsets(ctu_qp_offsets, h, w)
 
         with tempfile.TemporaryDirectory() as tmpdir:
             raw_in = Path(tmpdir) / "in.rgb"
-            bitstream = Path(tmpdir) / "out.hevc"
+            bitstream = Path(tmpdir) / "out.mp4"
             raw_out = Path(tmpdir) / "out.rgb"
             frames_np.tofile(str(raw_in))
 
-            cmd_enc = [
-                "ffmpeg", "-y", "-loglevel", "error",
-                "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{w}x{h}", "-r", "30",
-                "-i", str(raw_in),
-                "-c:v", "libx265", "-preset", self.preset,
-                "-x265-params", f"qp={qp}:aq-mode=2:log-level=none",
-                str(bitstream),
-            ]
+            # Use IPPP Low-Delay structure (bframes=0, keyint=t) and crf=qp with aq-mode=2
+            # so libx265 honors AV_FRAME_DATA_REGIONS_OF_INTEREST -> x265_picture.quantOffsets
+            x265_params = (
+                f"crf={qp}:bframes=0:keyint={t}:min-keyint={t}:scenecut=0:aq-mode=2:log-level=none"
+            )
+            cmd_enc = (
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-loglevel",
+                    "error",
+                    "-f",
+                    "rawvideo",
+                    "-pix_fmt",
+                    "rgb24",
+                    "-s",
+                    f"{w}x{h}",
+                    "-r",
+                    "25",
+                    "-i",
+                    str(raw_in),
+                ]
+                + vf_args
+                + [
+                    "-c:v",
+                    "libx265",
+                    "-preset",
+                    self.preset,
+                    "-x265-params",
+                    x265_params,
+                    str(bitstream),
+                ]
+            )
             subprocess.run(cmd_enc, check=True)
 
+            # Extract exact per-frame encoded byte sizes and frame types (I/P) via ffprobe
+            cmd_probe = [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "frame=pict_type,pkt_size",
+                "-of",
+                "json",
+                str(bitstream),
+            ]
+            probe_res = subprocess.run(cmd_probe, capture_output=True, text=True, check=True)
+            probe_frames = json.loads(probe_res.stdout).get("frames", [])
+            if len(probe_frames) != t:
+                raise RuntimeError(
+                    f"ffprobe returned {len(probe_frames)} frames, expected {t}"
+                )
+
+            frame_bpps_list: List[float] = []
+            frame_types: List[str] = []
+            for pf in probe_frames:
+                pkt_bytes = int(pf.get("pkt_size", 0))
+                frame_bpps_list.append((pkt_bytes * 8.0) / float(h * w))
+                frame_types.append(str(pf.get("pict_type", "P")))
+
             cmd_dec = [
-                "ffmpeg", "-y", "-loglevel", "error",
-                "-i", str(bitstream),
-                "-f", "rawvideo", "-pix_fmt", "rgb24",
+                "ffmpeg",
+                "-y",
+                "-loglevel",
+                "error",
+                "-i",
+                str(bitstream),
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgb24",
                 str(raw_out),
             ]
             subprocess.run(cmd_dec, check=True)
 
-            total_bits = bitstream.stat().st_size * 8.0
-            bpp = total_bits / float(t * h * w)
+            frame_bpps = torch.tensor(
+                frame_bpps_list, device=clip.device, dtype=clip.dtype
+            )
+            total_bpp = float(frame_bpps.mean().item())
             dec_np = np.fromfile(str(raw_out), dtype=np.uint8).reshape(t, h, w, 3)
-            recon_clip = torch.from_numpy(dec_np).to(device=clip.device, dtype=clip.dtype) / 255.0
+            recon_clip = (
+                torch.from_numpy(dec_np).to(device=clip.device, dtype=clip.dtype) / 255.0
+            )
             recon_clip = recon_clip.permute(0, 3, 1, 2).contiguous()
-            return recon_clip, bpp
+            return recon_clip, total_bpp, frame_bpps, frame_types
+
+    def _build_addroi_filter_from_mask_or_offsets(
+        self, ctu_qp_offsets: Optional[torch.Tensor], h: int, w: int
+    ) -> List[str]:
+        return self._build_addroi_filter_from_offsets(ctu_qp_offsets, h, w)
+
+    @torch.no_grad()
+    def evaluate_real_x265(
+        self,
+        video_edit: torch.Tensor,
+        qp: int,
+        ctu_qp_offsets: Optional[torch.Tensor] = None,
+    ) -> Dict[str, Any]:
+        """
+        Strict real-codec evaluation pathway (Gate 0.3 & Gate 0.4):
+        Never uses the proxy; encodes every clip with real `libx265`, passes `ctu_qp_offsets`
+        via `addroi` -> `x265_picture.quantOffsets`, and measures actual stream bytes via `ffprobe`.
+        """
+        b = video_edit.shape[0]
+        recons = []
+        frame_rate_rows = []
+        all_types: List[List[str]] = []
+
+        for idx in range(b):
+            off_i = ctu_qp_offsets[idx] if ctu_qp_offsets is not None else None
+            recon_i, _, f_bpps_i, f_types_i = self.encode_decode_x265_clip(
+                video_edit[idx].detach(), qp, off_i
+            )
+            recons.append(recon_i)
+            frame_rate_rows.append(f_bpps_i)
+            all_types.append(f_types_i)
+
+        video_recon = torch.stack(recons, dim=0)
+        rate_per_frame = torch.stack(frame_rate_rows, dim=0)  # [B, T]
+        return {
+            "video_recon": video_recon,
+            "rate_per_frame": rate_per_frame,
+            "total_bpp": float(rate_per_frame.mean().item()),
+            "i_frame_bpp": float(rate_per_frame[:, 0].mean().item()),
+            "p_frame_bpp": float(rate_per_frame[:, 1:].mean().item())
+            if rate_per_frame.shape[1] > 1
+            else float(rate_per_frame[:, 0].mean().item()),
+            "frame_types": all_types[0] if all_types else [],
+        }
 
     def forward(
         self,
@@ -221,24 +388,34 @@ class HybridX265STE(nn.Module):
         if not self.use_real_x265:
             return proxy_out
 
-        # Hybrid STE mode: run real x265 in forward pass, proxy in backward pass
+        # Hybrid STE mode: run real x265 in forward pass (with ctu_qp_offsets!), proxy in backward pass
         b = video_edit.shape[0]
         real_recons = []
         real_bpps = []
+        real_frame_bpps = []
         for idx in range(b):
             qp_val = int(round(22.0 + 25.0 * float(severity[idx].item())))
-            recon_i, bpp_i = self.encode_decode_x265_clip(video_edit[idx].detach(), qp_val)
+            off_i = ctu_qp_offsets[idx].detach() if ctu_qp_offsets is not None else None
+            recon_i, bpp_i, f_bpps_i, _ = self.encode_decode_x265_clip(
+                video_edit[idx].detach(), qp_val, off_i
+            )
             real_recons.append(recon_i)
             real_bpps.append(bpp_i)
+            real_frame_bpps.append(f_bpps_i)
 
         video_real = torch.stack(real_recons, dim=0)
-        # Straight-Through Estimator (STE)
+        frame_bpps_real = torch.stack(real_frame_bpps, dim=0)
+        # Straight-Through Estimator (STE) for both reconstructed pixels and per-frame rates
         video_ste = video_proxy + (video_real - video_proxy).detach()
         rate_real = torch.tensor(real_bpps, device=video_edit.device, dtype=video_edit.dtype)
         rate_ste = proxy_out["rate_proxy_bpp"] + (rate_real - proxy_out["rate_proxy_bpp"]).detach()
+        rate_per_frame_ste = (
+            proxy_out["rate_per_frame"]
+            + (frame_bpps_real - proxy_out["rate_per_frame"]).detach()
+        )
 
         return {
             "video_recon": video_ste,
             "rate_proxy_bpp": rate_ste,
-            "rate_per_frame": proxy_out["rate_per_frame"],
+            "rate_per_frame": rate_per_frame_ste,
         }

@@ -225,14 +225,14 @@ class TemporalSCOPE(nn.Module):
         # Object-preserving branch
         i_obj_t = torch.clamp(i_t + delta_obj_t, 0.0, 1.0)
 
-        # Temporally-anchored blurred-background branch
-        blur_i_t = gaussian_blur_5x5(i_t)
+        # Temporally-anchored low-pass background branch (3-pass 5x5 Gaussian = effective 13x13 sigma=2.1)
+        blur_i_t = gaussian_blur_5x5(gaussian_blur_5x5(gaussian_blur_5x5(i_t)))
         i_bg_spatial = torch.clamp(blur_i_t + delta_bg_t, 0.0, 1.0)
         if bg_prev is not None:
-            # Gate temporal EMA by motion magnitude so static backgrounds lock identically across frames
+            # Gate temporal EMA by motion magnitude so static backgrounds lock across frames
             motion_mag = diff_t.abs().mean(dim=1, keepdim=True)
             static_mask = torch.exp(-15.0 * motion_mag)
-            temporal_weight = 0.7 * torch.sigmoid(self.bg_temporal_gate(u1)) * static_mask
+            temporal_weight = 0.92 * torch.sigmoid(self.bg_temporal_gate(u1)) * static_mask
             i_bg_t = temporal_weight * bg_prev + (1.0 - temporal_weight) * i_bg_spatial
         else:
             i_bg_t = i_bg_spatial
@@ -246,6 +246,7 @@ class TemporalSCOPE(nn.Module):
         family_id: torch.Tensor,
         severity: torch.Tensor,
         reuse_iframe_qp: bool = False,
+        disable_temporal: bool = False,
     ) -> Dict[str, torch.Tensor]:
         """
         Args:
@@ -253,6 +254,8 @@ class TemporalSCOPE(nn.Module):
             family_id: [B] integer codec family index (0=x265, 1=VVenC, 2=x264, 3=Intra).
             severity: [B] normalized compression severity in [0, 1].
             reuse_iframe_qp: If True, reuses I-frame CTU Delta-QP across the GOP (IWA-QP mode).
+            disable_temporal: If True, processes every frame independently (h_prev=None, bg_prev=None,
+                i_prev=i_t), providing a strict, noise-free framewise Spatial-SCOPE baseline.
         """
         single_frame_input = video.dim() == 4
         if single_frame_input:
@@ -267,7 +270,12 @@ class TemporalSCOPE(nn.Module):
 
         for step in range(t):
             i_t = video[:, step]
-            i_prev = video[:, step - 1] if step > 0 else i_t
+            if disable_temporal:
+                i_prev = i_t
+                h_prev = None
+                bg_prev = None
+            else:
+                i_prev = video[:, step - 1] if step > 0 else i_t
             i_edit_t, attn_t, d_obj_t, d_bg_t, h_prev, bg_prev = self.forward_single_step(
                 i_t, i_prev, c, h_prev, bg_prev
             )

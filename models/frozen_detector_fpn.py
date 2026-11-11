@@ -1,4 +1,5 @@
-from typing import Dict, List, Tuple
+import math
+from typing import Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -142,15 +143,24 @@ class FrozenFPNDetectorTeacher(nn.Module):
         clean_video: torch.Tensor,
         recon_video: torch.Tensor,
         m_det: torch.Tensor,
+        gt_boxes: Optional[torch.Tensor] = None,
+        require_real_detector: bool = False,
     ) -> Dict[str, float]:
         """
-        Computes downstream machine vision task accuracy metrics between clean video
-        and compressed/reconstructed video:
-          1. `map50_pct` (0..100%): Faster R-CNN mAP@IoU=0.50 on reconstructed frames.
-          2. `map50_95_pct` (0..100%): Faster R-CNN COCO mAP@[.50:.95] on reconstructed frames.
-          3. `fpn_cos_sim_pct` (0..100%): Masked FPN feature cosine similarity inside M_det.
-          4. `task_roi_psnr_db`: Signal fidelity inside the detector context mask M_det.
+        Computes downstream machine vision task accuracy metrics between clean video,
+        compressed/reconstructed video, and true Ground-Truth bounding boxes (`gt/gt.txt`):
+          1. `gt_ap50_pct` (0..100%): Real Faster R-CNN AP@IoU=0.50 against ground-truth `gt/gt.txt` boxes (class=person).
+          2. `gt_ap50_95_pct` (0..100%): Real Faster R-CNN COCO AP@[.50:.95] against ground-truth `gt/gt.txt` boxes.
+          3. `teacher_ap50_pct` (0..100%): Teacher-prediction retention AP@0.50 (reported separately).
+          4. `fpn_cos_sim_pct` (0..100%): Masked FPN feature cosine similarity inside M_det.
+          5. `task_roi_psnr_db`: Signal fidelity inside the detector context mask M_det.
+        Never converts PSNR/cosine into synthetic mAP (Gate 0.5 / F04 fix).
         """
+        if require_real_detector and (not self.use_torchvision or self.detector is None):
+            raise RuntimeError(
+                "Gate 0.5 violation: Real torchvision Faster R-CNN detector weights are required for AP evaluation."
+            )
+
         b, t, c, h, w = clean_video.shape
         clean_flat = clean_video.view(b * t, c, h, w)
         recon_flat = recon_video.view(b * t, c, h, w)
@@ -174,49 +184,61 @@ class FrozenFPNDetectorTeacher(nn.Module):
         )
         psnr_obj = float(10.0 * torch.log10(1.0 / (mse_obj + 1e-8)).item())
 
-        # Compute Faster R-CNN mAP@50 and mAP@[.50:.95] when torchvision detector is active
+        gt_ap50_pct = float("nan")
+        gt_ap50_95_pct = float("nan")
+        teacher_ap50_pct = float("nan")
+
         if self.use_torchvision and self.detector is not None:
             self.detector.eval()
             clean_dets = self.detector(list(torch.clamp(clean_flat, 0.0, 1.0)))
             recon_dets = self.detector(list(torch.clamp(recon_flat, 0.0, 1.0)))
             iou_thresholds = [0.50 + 0.05 * i for i in range(10)]
-            ap50_list: List[float] = []
-            ap50_95_list: List[float] = []
+
+            gt_ap50_list: List[float] = []
+            gt_ap50_95_list: List[float] = []
+            teacher_ap50_list: List[float] = []
+
+            gt_flat = gt_boxes.view(b * t, -1, 4) if gt_boxes is not None else None
 
             for f_idx, (c_det, r_det) in enumerate(zip(clean_dets, recon_dets)):
-                gt_keep = c_det["scores"] >= 0.50
-                gt_b = c_det["boxes"][gt_keep]
-                if gt_b.shape[0] == 0:
-                    gt_b = self._extract_connected_boxes_from_mask(m_det_flat[f_idx, 0])
-                if gt_b.shape[0] == 0:
-                    continue
+                # Filter predictions to COCO class 1 (person / pedestrian) for MOT17
+                person_mask_r = (r_det["labels"] == 1) & (r_det["scores"] >= 0.05)
+                pred_b = r_det["boxes"][person_mask_r]
+                pred_s = r_det["scores"][person_mask_r]
 
-                pred_keep = r_det["scores"] >= 0.05
-                pred_b = r_det["boxes"][pred_keep]
-                pred_s = r_det["scores"][pred_keep]
+                # 1. Official Ground-Truth AP against annotated gt/gt.txt boxes
+                if gt_flat is not None:
+                    f_gt = gt_flat[f_idx].to(pred_b.device)
+                    valid_gt = f_gt[f_gt[:, 0] >= 0.0]
+                    if valid_gt.shape[0] > 0:
+                        aps_gt = [
+                            self._compute_ap_at_iou(valid_gt, pred_b, pred_s, iou_thresh=thr)
+                            for thr in iou_thresholds
+                        ]
+                        gt_ap50_list.append(aps_gt[0] * 100.0)
+                        gt_ap50_95_list.append(float(sum(aps_gt) / len(aps_gt)) * 100.0)
 
-                aps_t = [
-                    self._compute_ap_at_iou(gt_b, pred_b, pred_s, iou_thresh=thr)
-                    for thr in iou_thresholds
-                ]
-                ap50_list.append(aps_t[0] * 100.0)
-                ap50_95_list.append(float(sum(aps_t) / len(aps_t)) * 100.0)
+                # 2. Separate Teacher-Agreement Retention AP@50 (clean detector person boxes score >= 0.5)
+                person_mask_c = (c_det["labels"] == 1) & (c_det["scores"] >= 0.50)
+                t_gt_b = c_det["boxes"][person_mask_c]
+                if t_gt_b.shape[0] > 0:
+                    t_ap50 = self._compute_ap_at_iou(t_gt_b, pred_b, pred_s, iou_thresh=0.50)
+                    teacher_ap50_list.append(t_ap50 * 100.0)
 
-            map50_pct = float(sum(ap50_list) / len(ap50_list)) if ap50_list else fpn_cos_pct
-            map50_95_pct = (
-                float(sum(ap50_95_list) / len(ap50_95_list))
-                if ap50_95_list
-                else fpn_cos_pct * 0.72
-            )
-        else:
-            # Calibrated proxy mAP from ROI-PSNR & FPN cosine similarity when offline
-            snr_factor = max(0.0, min(1.0, (psnr_obj - 18.0) / 22.0))
-            map50_pct = float(fpn_cos_pct * (0.65 + 0.35 * snr_factor))
-            map50_95_pct = float(map50_pct * (0.58 + 0.20 * snr_factor))
+            if gt_ap50_list:
+                gt_ap50_pct = float(sum(gt_ap50_list) / len(gt_ap50_list))
+                gt_ap50_95_pct = float(sum(gt_ap50_95_list) / len(gt_ap50_95_list))
+            if teacher_ap50_list:
+                teacher_ap50_pct = float(sum(teacher_ap50_list) / len(teacher_ap50_list))
 
         return {
-            "map50_pct": round(map50_pct, 3),
-            "map50_95_pct": round(map50_95_pct, 3),
+            "gt_ap50_pct": round(gt_ap50_pct, 3) if not math.isnan(gt_ap50_pct) else -1.0,
+            "gt_ap50_95_pct": round(gt_ap50_95_pct, 3) if not math.isnan(gt_ap50_95_pct) else -1.0,
+            "teacher_ap50_pct": round(teacher_ap50_pct, 3) if not math.isnan(teacher_ap50_pct) else -1.0,
+            "map50_pct": round(gt_ap50_pct if not math.isnan(gt_ap50_pct) else teacher_ap50_pct, 3)
+            if not (math.isnan(gt_ap50_pct) and math.isnan(teacher_ap50_pct))
+            else -1.0,
+            "map50_95_pct": round(gt_ap50_95_pct, 3) if not math.isnan(gt_ap50_95_pct) else -1.0,
             "fpn_cos_sim_pct": round(fpn_cos_pct, 3),
             "task_roi_psnr_db": round(psnr_obj, 3),
         }

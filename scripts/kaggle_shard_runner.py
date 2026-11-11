@@ -203,10 +203,12 @@ def build_sharded_dataset(
             stride=stride,
             img_size=args.img_size,
             is_train=is_train,
+            enforce_disjoint_split=getattr(args, "disjoint_split", True),
         )
         if len(real_ds) > 0:
+            split_tag = "TRAIN" if is_train else "HELD-OUT TEST"
             print(
-                f"[Dataset] Loaded {len(real_ds)} real MOT17/VCM clips "
+                f"[Dataset] Loaded {len(real_ds)} real MOT17/VCM clips [{split_tag}] "
                 f"({len(real_ds) * args.clip_len} frames, stride={stride}) from '{data_root}' "
                 f"for shard {args.shard_id}/{args.num_shards}"
             )
@@ -387,40 +389,69 @@ def run_poc_wishlist2_and_eval_shard(args: argparse.Namespace) -> None:
             sev = torch.tensor([(qp - 22.0) / 25.0], device=device, dtype=torch.float32)
             fam = torch.tensor([0], device=device, dtype=torch.long)
 
-            # 1. Baseline Direct Codec (Anchor)
-            base_out = codec.proxy(video, sev, None)
+            # 1. Baseline Direct Codec (Anchor — Real libx265 bytes via ffprobe)
+            base_out = codec.evaluate_real_x265(video, qp, None)
 
-            # Predict T-SCOPE attention & temporal state
-            pred_tscope = model(video, fam, sev, reuse_iframe_qp=False)
-            eff_attn = torch.maximum(pred_tscope["attn_map"] * m_det, m_det)
-            blur_v = gaussian_blur_5x5(video.view(b * t, 3, h, w)).view(b, t, 3, h, w)
+            # 2. Deterministic Blur + Motion-Gated EMA Baseline (Non-learned control, F03 fix)
+            blur_v = gaussian_blur_5x5(
+                gaussian_blur_5x5(gaussian_blur_5x5(video.view(b * t, 3, h, w)))
+            ).view(b, t, 3, h, w)
+            dx = torch.nn.functional.pad((video[..., :, 1:] - video[..., :, :-1]).abs(), (0, 1, 0, 0))
+            dy = torch.nn.functional.pad((video[..., 1:, :] - video[..., :-1, :]).abs(), (0, 0, 0, 1))
+            edge_gate = torch.clamp((dx + dy).mean(dim=2, keepdim=True) * 6.0, 0.0, 1.0)
+            v_det_ema = edge_gate * video + (1.0 - edge_gate) * blur_v[:, 0:1].expand_as(blur_v)
+            det_ema_out = codec.evaluate_real_x265(v_det_ema, qp, None)
 
-            # 2. Spatial-Only Frame-by-Frame Pre-Editing (SCOPE: clean ROI, independent per-frame background)
-            spatial_jitter = 0.015 * torch.randn_like(video)
-            v_spatial_scope = eff_attn * video + (1.0 - eff_attn) * torch.clamp(
-                blur_v + spatial_jitter, 0.0, 1.0
+            # 3. Spatial-Only Frame-by-Frame Learned SCOPE (Noise-free, disable_temporal=True, F02/F03 fix)
+            pred_spatial = model(
+                video, fam, sev, reuse_iframe_qp=False, disable_temporal=True
             )
-            spatial_out = codec.proxy(v_spatial_scope, sev, None)
+            spatial_out = codec.evaluate_real_x265(pred_spatial["i_edit"], qp, None)
 
-            # 3. T-SCOPE (Temporally-Locked Background + CTU Delta-QP Coupling)
-            bg_locked = blur_v[:, 0:1].expand_as(blur_v)
-            v_tscope = eff_attn * video + (1.0 - eff_attn) * bg_locked
-            ctu_qp = model.compute_ctu_qp_offsets(eff_attn)
-            tscope_out = codec.proxy(v_tscope, sev, ctu_qp)
+            # 4. T-SCOPE Autonomous Learned (100% pred["i_edit"] + pred["ctu_qp_offsets"], ZERO GT at inference, F01/F02/F05 fix)
+            pred_tscope = model(
+                video,
+                fam,
+                sev,
+                reuse_iframe_qp=preset_cfg["reuse_iframe_qp"],
+                disable_temporal=(args.variant == "spatial_only_scope"),
+            )
+            tscope_qp = (
+                pred_tscope["ctu_qp_offsets"]
+                if preset_cfg["max_delta_qp"] > 0
+                else None
+            )
+            tscope_out = codec.evaluate_real_x265(pred_tscope["i_edit"], qp, tscope_qp)
+
+            # 5. Explicitly Labeled Oracle Upper Bound (Uses Ground-Truth M_det mask)
+            v_oracle = m_det * video + (1.0 - m_det) * blur_v[:, 0:1].expand_as(blur_v)
+            oracle_qp = model.compute_ctu_qp_offsets(
+                m_det, reuse_iframe_across_gop=preset_cfg["reuse_iframe_qp"]
+            )
+            oracle_out = codec.evaluate_real_x265(v_oracle, qp, oracle_qp)
+
+            gt_boxes = (
+                sample["gt_boxes"].unsqueeze(0).to(device)
+                if "gt_boxes" in sample
+                else None
+            )
 
             for method_name, c_out in [
                 ("anchor_x265", base_out),
+                ("deterministic_blur_ema", det_ema_out),
                 ("spatial_scope_framewise", spatial_out),
                 ("tscope_temporal_ctu_qp", tscope_out),
+                ("oracle_gt_mask_upper_bound", oracle_out),
             ]:
                 recon = c_out["video_recon"]
-                rate_frames = c_out["rate_per_frame"][0].cpu().tolist()
-                i_frame_bpp = float(rate_frames[0])
-                p_frame_bpp = float(np.mean(rate_frames[1:])) if len(rate_frames) > 1 else i_frame_bpp
-                total_bpp = float(np.mean(rate_frames))
+                i_frame_bpp = float(c_out["i_frame_bpp"])
+                p_frame_bpp = float(c_out["p_frame_bpp"])
+                total_bpp = float(c_out["total_bpp"])
 
-                # Task-region fidelity & FPN feature cosine similarity inside M_det
-                acc_metrics = fpn_teacher.evaluate_task_accuracy(video, recon, m_det)
+                # Task-region fidelity & Official GT-box AP inside M_det
+                acc_metrics = fpn_teacher.evaluate_task_accuracy(
+                    video, recon, m_det, gt_boxes=gt_boxes
+                )
 
                 shard_records.append(
                     {
@@ -433,6 +464,9 @@ def run_poc_wishlist2_and_eval_shard(args: argparse.Namespace) -> None:
                         "total_bpp": round(total_bpp, 5),
                         "i_frame_bpp": round(i_frame_bpp, 5),
                         "p_frame_bpp": round(p_frame_bpp, 5),
+                        "gt_ap50_pct": acc_metrics["gt_ap50_pct"],
+                        "gt_ap50_95_pct": acc_metrics["gt_ap50_95_pct"],
+                        "teacher_ap50_pct": acc_metrics["teacher_ap50_pct"],
                         "map50_pct": acc_metrics["map50_pct"],
                         "map50_95_pct": acc_metrics["map50_95_pct"],
                         "task_roi_psnr_db": acc_metrics["task_roi_psnr_db"],
