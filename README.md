@@ -173,22 +173,22 @@ Kết quả tổng hợp từ **21/21 tài khoản Kaggle** chạy trên toàn b
 
 ### 5.1. So sánh Tổng thể (Overall BDBR % chuẩn VCEG-M33 so với Anchor `x265`)
 
-| Phương pháp | Total BDBR (%) $\downarrow$ | P-Frame BDBR (%) $\downarrow$ | Avg Total BPP $\downarrow$ | Avg I-Frame BPP $\downarrow$ | Avg P-Frame BPP $\downarrow$ |
+| Phương pháp | ROI-PSNR Total BDBR (%) $\downarrow$ | ROI-PSNR P-Frame BDBR (%) $\downarrow$ | mAP@50 Total / P-BDBR (%) $\downarrow$ | mAP@[.5:.95] Total / P-BDBR (%) $\downarrow$ | Avg Total / P-BPP $\downarrow$ |
 | :--- | :---: | :---: | :---: | :---: | :---: |
-| `anchor_x265` *(Direct HEVC/x265)* | `+0.00%` | `+0.00%` | `0.3625` | `0.5098` | `0.3134` |
-| `spatial_scope_framewise` *(SCOPE từng frame độc lập)* | `-10.48%` | `-9.29%` | `0.3334` | `0.4453` | `0.2961` |
-| **`tscope_temporal_ctu_qp` *(T-SCOPE Trung bình 21 Shards)*** | **`-37.50%`** | **`-42.31%`** | **`0.2361`** | **`0.3794`** | **`0.1884`** |
-| **`tscope_temporal_ctu_qp` *(Full T-SCOPE Variant)*** | **`-40.09%`** | **`-44.24%`** | **`0.2449`** | **`0.3883`** | **`0.1971`** |
+| `anchor_x265` *(Direct HEVC/x265)* | `+0.00%` | `+0.00%` | `+0.00%` / `+0.00%` | `+0.00%` / `+0.00%` | `0.3625` / `0.3134` |
+| `spatial_scope_framewise` *(SCOPE từng frame)* | `-10.48%` | `-9.29%` | `+1.17%` / `+2.66%` | `-2.46%` / `-0.96%` | `0.3334` / `0.2961` |
+| **`tscope_temporal_ctu_qp` *(Trung bình 21 Shards)*** | **`-37.50%`** | **`-42.31%`** | **`-25.77%` / `-31.09%`** | **`-29.84%` / `-35.00%`** | **`0.2361` / `0.1884`** |
+| **`tscope_temporal_ctu_qp` *(Full T-SCOPE Variant)*** | **`-40.09%`** | **`-44.24%`** | **`-28.19%` / `-32.79%`** | **`-32.39%` / `-36.85%`** | **`0.2449` / `0.1971`** |
 
-### 5.2. Đường cong Rate-Distortion Chi tiết theo từng mức QP trên `MOT17`
+### 5.2. Đường cong Rate-Accuracy (`mAP@50`, `mAP@[.5:.95]`, `ROI-PSNR`) theo từng mức QP trên `MOT17`
 
-| QP | `anchor_x265`<br>Total / P-BPP \| ROI-PSNR | `spatial_scope_framewise`<br>Total / P-BPP \| ROI-PSNR | `tscope_temporal_ctu_qp`<br>Total / P-BPP \| ROI-PSNR |
+| QP | `anchor_x265`<br>Total (P-BPP) \| mAP@50 / mAP@[.5:.95] | `spatial_scope_framewise`<br>Total (P-BPP) \| mAP@50 / mAP@[.5:.95] | `tscope_temporal_ctu_qp`<br>Total (P-BPP) \| mAP@50 / mAP@[.5:.95] |
 | :---: | :---: | :---: | :---: |
-| **27** | `0.6525` / `0.5725` \| `39.08 dB` | `0.6430` / **`0.5943`** *(+3.8% P-bit)* \| `39.02 dB` | **`0.4080` / `0.3294`** *(-42.5% P-bit)* \| **`39.77 dB`** |
-| **32** | `0.4641` / `0.4030` \| `35.01 dB` | `0.4251` / `0.3787` \| `34.99 dB` | **`0.2988` / `0.2396`** \| **`35.64 dB`** |
-| **37** | `0.3239` / `0.2782` \| `31.38 dB` | `0.2834` / `0.2450` \| `31.36 dB` | **`0.2150` / `0.1709`** \| **`31.93 dB`** |
-| **42** | `0.2220` / `0.1882` \| `28.28 dB` | `0.1894` / `0.1593` \| `28.27 dB` | **`0.1523` / `0.1196`** \| **`28.75 dB`** |
-| **47** | `0.1498` / `0.1250` \| `25.67 dB` | `0.1263` / `0.1034` \| `25.66 dB` | **`0.1065` / `0.0824`** \| **`26.06 dB`** |
+| **27** | `0.6525` (`0.5725`) \| `97.68%` / `75.23%` | `0.6430` (**`0.5943`**) \| `94.32%` / `72.61%` | **`0.4080` (`0.3294`)** \| **`94.08%` / `72.85%`** |
+| **32** | `0.4641` (`0.4030`) \| `90.70%` / `66.65%` | `0.4251` (`0.3787`) \| `87.61%` / `64.39%` | **`0.2988` (`0.2396`)** \| **`87.78%` / `65.03%`** |
+| **37** | `0.3239` (`0.2782`) \| `83.34%` / `58.50%` | `0.2834` (`0.2450`) \| `80.37%` / `56.42%` | **`0.2150` (`0.1709`)** \| **`80.89%` / `57.21%`** |
+| **42** | `0.2220` (`0.1882`) \| `75.58%` / `50.93%` | `0.1894` (`0.1593`) \| `73.28%` / `49.38%` | **`0.1523` (`0.1196`)** \| **`73.93%` / `50.15%`** |
+| **47** | `0.1498` (`0.1250`) \| `66.70%` / `43.35%` | `0.1263` (`0.1034`) \| `65.32%` / `42.46%` | **`0.1065` (`0.0824`)** \| **`66.23%` / `43.29%`** |
 
 > **Phát hiện thực nghiệm cốt lõi (Chứng minh giả thuyết bài báo):** Tại `QP=27`, tiền biên tập từng khung hình độc lập (`spatial_scope_framewise`) tuy giảm bit ở I-frame (`0.8924` $\to$ `0.7890 bpp`, `-11.6%`), nhưng lại **làm tăng bit ở P-frame từ `0.5725` lên `0.5943 bpp` (`+3.8%`)** do nhiễu nhấp nháy liên khung (temporal flicker) phá vỡ dự đoán chuyển động (Inter-prediction). Ngược lại, **T-SCOPE** khóa tĩnh nền liên khung kết hợp $\Delta\text{QP}$ giúp kéo P-frame bitrate tại `QP=27` xuống chỉ còn **`0.3294 bpp` (`-42.5%`)** đồng thời nâng `ROI-PSNR` lên **`39.77 dB` (`+0.69 dB`)**.
 

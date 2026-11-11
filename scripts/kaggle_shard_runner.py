@@ -433,6 +433,8 @@ def run_poc_wishlist2_and_eval_shard(args: argparse.Namespace) -> None:
                         "total_bpp": round(total_bpp, 5),
                         "i_frame_bpp": round(i_frame_bpp, 5),
                         "p_frame_bpp": round(p_frame_bpp, 5),
+                        "map50_pct": acc_metrics["map50_pct"],
+                        "map50_95_pct": acc_metrics["map50_95_pct"],
                         "task_roi_psnr_db": acc_metrics["task_roi_psnr_db"],
                         "fpn_cos_sim_pct": acc_metrics["fpn_cos_sim_pct"],
                     }

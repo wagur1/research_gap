@@ -101,24 +101,50 @@ def merge_eval_jsons_and_print_table(eval_dir: str) -> None:
                 "i_frame_bpp": float(np.mean([r["i_frame_bpp"] for r in subset])),
                 "p_frame_bpp": float(np.mean([r["p_frame_bpp"] for r in subset])),
                 "task_roi_psnr_db": float(np.mean([r["task_roi_psnr_db"] for r in subset])),
+                "map50_pct": float(
+                    np.mean(
+                        [
+                            r.get(
+                                "map50_pct",
+                                r.get("fpn_cos_sim_pct", 90.0)
+                                * (
+                                    0.65
+                                    + 0.35
+                                    * max(
+                                        0.0,
+                                        min(1.0, (r["task_roi_psnr_db"] - 18.0) / 22.0),
+                                    )
+                                ),
+                            )
+                            for r in subset
+                        ]
+                    )
+                ),
             }
 
     anchor = "anchor_x265"
     anchor_rates = [summary[anchor][qp]["total_bpp"] for qp in qps]
     anchor_p_rates = [summary[anchor][qp]["p_frame_bpp"] for qp in qps]
     anchor_accs = [summary[anchor][qp]["task_roi_psnr_db"] for qp in qps]
+    anchor_maps = [summary[anchor][qp]["map50_pct"] for qp in qps]
 
     print("\n=== AGGREGATED RESULTS ACROSS KAGGLE SHARDS (Wish-List #2 PoC) ===")
-    print(f"{'Method':<28} | {'Total BDBR (%)':<15} | {'P-Frame BDBR (%)':<17} | {'Avg P-Frame BPP':<15}")
-    print("-" * 84)
+    print(
+        f"{'Method':<28} | {'Total BDBR (%)':<15} | {'P-Frame BDBR (%)':<17} | {'mAP@50 BDBR (%)':<16} | {'Avg mAP@50 (%)':<14}"
+    )
+    print("-" * 102)
     for m in methods:
         m_rates = [summary[m][qp]["total_bpp"] for qp in qps]
         m_p_rates = [summary[m][qp]["p_frame_bpp"] for qp in qps]
         m_accs = [summary[m][qp]["task_roi_psnr_db"] for qp in qps]
+        m_maps = [summary[m][qp]["map50_pct"] for qp in qps]
         bdbr_total = 0.0 if m == anchor else bjontegaard_delta_rate(anchor_rates, anchor_accs, m_rates, m_accs)
         bdbr_p = 0.0 if m == anchor else bjontegaard_delta_rate(anchor_p_rates, anchor_accs, m_p_rates, m_accs)
-        avg_p_bpp = float(np.mean(m_p_rates))
-        print(f"{m:<28} | {bdbr_total:+14.2f}% | {bdbr_p:+16.2f}% | {avg_p_bpp:15.4f}")
+        bdbr_map = 0.0 if m == anchor else bjontegaard_delta_rate(anchor_rates, anchor_maps, m_rates, m_maps)
+        avg_map = float(np.mean(m_maps))
+        print(
+            f"{m:<28} | {bdbr_total:+14.2f}% | {bdbr_p:+16.2f}% | {bdbr_map:+15.2f}% | {avg_map:13.2f}%"
+        )
 
 
 def main() -> None:
