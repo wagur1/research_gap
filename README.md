@@ -164,3 +164,41 @@ VARIANT = "full_tscope"  # Hoặc: spatial_only_scope | wo_ctu_delta_qp | iwa_go
     --enable_x265_ste \
     --output_dir /kaggle/working/outputs
 ```
+
+---
+
+## 5. Kết quả Thực nghiệm Full-Scale trên `MOT17` (21 Kaggle Shards, 5,308 Frames)
+
+Kết quả tổng hợp từ **21/21 tài khoản Kaggle** chạy trên toàn bộ 7 chuỗi video `MOT17/train` (**1,327 clips = 5,308 frames** đánh giá qua 5 mức $\text{QP} \in \{27, 32, 37, 42, 47\}$, tổng cộng **19,905 bản ghi mã hóa**):
+
+### 5.1. So sánh Tổng thể (Overall BDBR % chuẩn VCEG-M33 so với Anchor `x265`)
+
+| Phương pháp | Total BDBR (%) $\downarrow$ | P-Frame BDBR (%) $\downarrow$ | Avg Total BPP $\downarrow$ | Avg I-Frame BPP $\downarrow$ | Avg P-Frame BPP $\downarrow$ |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| `anchor_x265` *(Direct HEVC/x265)* | `+0.00%` | `+0.00%` | `0.3625` | `0.5098` | `0.3134` |
+| `spatial_scope_framewise` *(SCOPE từng frame độc lập)* | `-10.48%` | `-9.29%` | `0.3334` | `0.4453` | `0.2961` |
+| **`tscope_temporal_ctu_qp` *(T-SCOPE Trung bình 21 Shards)*** | **`-37.50%`** | **`-42.31%`** | **`0.2361`** | **`0.3794`** | **`0.1884`** |
+| **`tscope_temporal_ctu_qp` *(Full T-SCOPE Variant)*** | **`-40.09%`** | **`-44.24%`** | **`0.2449`** | **`0.3883`** | **`0.1971`** |
+
+### 5.2. Đường cong Rate-Distortion Chi tiết theo từng mức QP trên `MOT17`
+
+| QP | `anchor_x265`<br>Total / P-BPP \| ROI-PSNR | `spatial_scope_framewise`<br>Total / P-BPP \| ROI-PSNR | `tscope_temporal_ctu_qp`<br>Total / P-BPP \| ROI-PSNR |
+| :---: | :---: | :---: | :---: |
+| **27** | `0.6525` / `0.5725` \| `39.08 dB` | `0.6430` / **`0.5943`** *(+3.8% P-bit)* \| `39.02 dB` | **`0.4080` / `0.3294`** *(-42.5% P-bit)* \| **`39.77 dB`** |
+| **32** | `0.4641` / `0.4030` \| `35.01 dB` | `0.4251` / `0.3787` \| `34.99 dB` | **`0.2988` / `0.2396`** \| **`35.64 dB`** |
+| **37** | `0.3239` / `0.2782` \| `31.38 dB` | `0.2834` / `0.2450` \| `31.36 dB` | **`0.2150` / `0.1709`** \| **`31.93 dB`** |
+| **42** | `0.2220` / `0.1882` \| `28.28 dB` | `0.1894` / `0.1593` \| `28.27 dB` | **`0.1523` / `0.1196`** \| **`28.75 dB`** |
+| **47** | `0.1498` / `0.1250` \| `25.67 dB` | `0.1263` / `0.1034` \| `25.66 dB` | **`0.1065` / `0.0824`** \| **`26.06 dB`** |
+
+> **Phát hiện thực nghiệm cốt lõi (Chứng minh giả thuyết bài báo):** Tại `QP=27`, tiền biên tập từng khung hình độc lập (`spatial_scope_framewise`) tuy giảm bit ở I-frame (`0.8924` $\to$ `0.7890 bpp`, `-11.6%`), nhưng lại **làm tăng bit ở P-frame từ `0.5725` lên `0.5943 bpp` (`+3.8%`)** do nhiễu nhấp nháy liên khung (temporal flicker) phá vỡ dự đoán chuyển động (Inter-prediction). Ngược lại, **T-SCOPE** khóa tĩnh nền liên khung kết hợp $\Delta\text{QP}$ giúp kéo P-frame bitrate tại `QP=27` xuống chỉ còn **`0.3294 bpp` (`-42.5%`)** đồng thời nâng `ROI-PSNR` lên **`39.77 dB` (`+0.69 dB`)**.
+
+### 5.3. Bảng Ablation Study trên 5 Cấu hình (Chia trên 21 Shards)
+
+| Ablation Variant | Cơ chế kích hoạt | Số Clips (`MOT17`) | Total BDBR (%) $\downarrow$ | P-Frame BDBR (%) $\downarrow$ |
+| :--- | :--- | :---: | :---: | :---: |
+| `spatial_scope_framewise` | Baseline SCOPE từng frame độc lập (Không nhớ thời gian, $\Delta\text{QP}=0$) | 1,327 | `-10.48%` | `-9.29%` |
+| `wo_ctu_delta_qp` | + Khóa nền liên khung (`ConvGRU` + EMA), tắt $\Delta\text{QP}$ ($\kappa_{\max}=0$) | 253 | `-35.43%` | `-40.75%` |
+| `proxy_only_zhao` | + Huấn luyện chỉ với Virtual Proxy (không có `x265` STE, $\kappa_{\max}=0$) | 252 | `-35.45%` | `-40.81%` |
+| `iwa_gop_qp_reuse` | + T-SCOPE + Tái sử dụng $\Delta\text{QP}$ của I-frame cho toàn GOP ($0\%$ P-frame signaling) | 253 | `-40.05%` | **`-44.29%`** |
+| **`full_tscope`** | **Full T-SCOPE (`ConvGRU` + EMA + CTU $\Delta\text{QP} \in [-4,+4]$ + Hybrid `x265` STE)** | 316 | **`-40.09%`** | `-44.24%` |
+
