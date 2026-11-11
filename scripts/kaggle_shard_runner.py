@@ -239,6 +239,10 @@ def run_train_shard(args: argparse.Namespace) -> None:
         dataset, batch_size=args.batch_size, shuffle=True, num_workers=2, pin_memory=True
     )
 
+    # Common initialization seed across all shards (F18 fix: prevents feature permutation in Model Soup)
+    torch.manual_seed(2026)
+    np.random.seed(2026)
+
     base_model = TemporalSCOPE(
         base_ch=48,
         num_families=4,
@@ -288,6 +292,7 @@ def run_train_shard(args: argparse.Namespace) -> None:
                     family_id,
                     severity,
                     reuse_iframe_qp=preset_cfg["reuse_iframe_qp"],
+                    disable_temporal=(args.variant == "spatial_only_scope"),
                 )
                 codec_out = codec_ste(
                     out["i_edit"], severity, out["ctu_qp_offsets"]

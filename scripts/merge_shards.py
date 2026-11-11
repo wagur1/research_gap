@@ -48,28 +48,49 @@ def bjontegaard_delta_rate(
 def merge_checkpoints_soup(ckpt_dir: str, output_ckpt: str) -> None:
     """
     Aggregates trained shard checkpoints from multiple Kaggle accounts via
-    Model Soup / Federated Averaging (Wortsman et al., ICML 2022; DiLoCo 2024).
+    Model Soup / Federated Averaging, strictly grouped by `variant` (F18 fix:
+    never averages across different ablation variants).
     """
-    files = sorted(glob.glob(str(Path(ckpt_dir) / "*.pt")))
+    files = sorted(
+        f
+        for f in glob.glob(str(Path(ckpt_dir) / "tscope_*_shard*.pt"))
+        if "merged_soup" not in f
+    )
     if not files:
-        print(f"No .pt checkpoints found in {ckpt_dir}")
+        print(f"No shard .pt checkpoints found in {ckpt_dir}")
         return
 
-    avg_state: Dict[str, torch.Tensor] = {}
-    for idx, fpath in enumerate(files):
+    by_variant: Dict[str, List[str]] = {}
+    for fpath in files:
         ckpt = torch.load(fpath, map_location="cpu")
-        state = ckpt.get("state_dict", ckpt)
-        for k, v in state.items():
-            if idx == 0:
-                avg_state[k] = v.clone().to(torch.float32)
-            else:
-                avg_state[k] += v.to(torch.float32)
+        var_name = str(ckpt.get("variant", "full_tscope"))
+        by_variant.setdefault(var_name, []).append(fpath)
 
-    for k in avg_state:
-        avg_state[k] /= float(len(files))
+    for var_name, v_files in sorted(by_variant.items()):
+        avg_state: Dict[str, torch.Tensor] = {}
+        for idx, fpath in enumerate(v_files):
+            ckpt = torch.load(fpath, map_location="cpu")
+            state = ckpt.get("state_dict", ckpt)
+            for k, v in state.items():
+                if idx == 0:
+                    avg_state[k] = v.clone().to(torch.float32)
+                else:
+                    avg_state[k] += v.to(torch.float32)
 
-    torch.save({"merged_shards": len(files), "state_dict": avg_state}, output_ckpt)
-    print(f"Merged {len(files)} shard checkpoints into Model Soup -> {output_ckpt}")
+        for k in avg_state:
+            avg_state[k] /= float(len(v_files))
+
+        var_out = str(Path(ckpt_dir) / f"tscope_soup_{var_name}.pt")
+        torch.save(
+            {"variant": var_name, "merged_shards": len(v_files), "state_dict": avg_state},
+            var_out,
+        )
+        print(f"Merged {len(v_files)} same-variant ({var_name}) checkpoints -> {var_out}")
+        if var_name == "full_tscope":
+            torch.save(
+                {"variant": var_name, "merged_shards": len(v_files), "state_dict": avg_state},
+                output_ckpt,
+            )
 
 
 def merge_eval_jsons_and_print_table(eval_dir: str) -> None:
