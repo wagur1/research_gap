@@ -202,3 +202,17 @@ Kết quả tổng hợp từ **21/21 tài khoản Kaggle** chạy trên toàn b
 | `iwa_gop_qp_reuse` | + T-SCOPE + Tái sử dụng $\Delta\text{QP}$ của I-frame cho toàn GOP ($0\%$ P-frame signaling) | 253 | `-40.05%` | **`-44.29%`** |
 | **`full_tscope`** | **Full T-SCOPE (`ConvGRU` + EMA + CTU $\Delta\text{QP} \in [-4,+4]$ + Hybrid `x265` STE)** | 316 | **`-40.09%`** | `-44.24%` |
 
+### 5.4. Khả năng Tổng quát hóa Zero-Shot Đa Kiến trúc Backbone (`eval_cross_backbone_bdbr.py`)
+
+Chỉ huấn luyện **1 mô hình T-SCOPE duy nhất** với giám sát từ mạng đóng băng `Faster R-CNN (ResNet50-FPN v2)`, sau đó kiểm thử **Zero-Shot (không huấn luyện lại)** trên 5 kiến trúc Detector / Backbone khác nhau trên toàn bộ 7 chuỗi `MOT17`:
+
+| Backbone / Detector | Họ Kiến trúc (Paradigm) | Spatial SCOPE Total / P-BDBR (%) | **T-SCOPE Total BDBR (%)** $\downarrow$ | **T-SCOPE P-Frame BDBR (%)** $\downarrow$ | **T-SCOPE `mAP@50` BDBR (%)** $\downarrow$ |
+| :--- | :--- | :---: | :---: | :---: | :---: |
+| **`Faster R-CNN (ResNet50-FPN v2)`** | Two-Stage Anchor *(In-domain Teacher)* | `+1.93%` / `+3.89%` | **`-38.60%`** | **`-45.71%`** | **`-28.06%`** |
+| **`RetinaNet (ResNet50-FPN v2)`** | One-Stage Dense Focal-Loss *(Zero-Shot)* | `+0.75%` / `+2.62%` | **`-40.38%`** | **`-47.32%`** | **`-30.35%`** |
+| **`FCOS (ResNet50-FPN)`** | One-Stage Anchor-Free *(Zero-Shot)* | `+4.58%` / `+6.60%` | **`-36.69%`** | **`-43.93%`** | **`-28.80%`** |
+| **`SSDLite (MobileNetV3-Large)`** | Lightweight Edge Mobile CNN *(Zero-Shot)* | `+4.65%` / `+6.82%` | **`-37.21%`** | **`-44.44%`** | **`-20.16%`** |
+| **`Swin-T (Swin Transformer)`** | Hierarchical Vision Transformer *(Zero-Shot)* | `-8.89%` / `-7.46%` | **`-47.01%`** | **`-53.33%`** | **`-38.05%`** |
+| **Trung bình 5 Kiến trúc** | *CNN (2-Stage, 1-Stage, Mobile) + ViT* | **`+0.60%` / `+2.49%`** | **`-39.98%`** | **`-46.95%`** | **`-29.08%`** |
+
+
