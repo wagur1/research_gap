@@ -67,8 +67,12 @@ def main() -> None:
     sev = torch.tensor([(qp - 22.0) / 25.0], dtype=torch.float32)
     fam = torch.tensor([0], dtype=torch.long)
 
-    tscope_ckpt = rigor_dir / "tscope_autonomous_disjoint.pt"
-    spatial_ckpt = rigor_dir / "spatial_scope_autonomous_disjoint.pt"
+    tscope_ckpt = ROOT_DIR / "outputs_kaggle_disjoint" / "tscope_soup_full_tscope.pt"
+    spatial_ckpt = ROOT_DIR / "outputs_kaggle_disjoint" / "tscope_soup_spatial_only_scope.pt"
+    if not tscope_ckpt.exists():
+        tscope_ckpt = rigor_dir / "tscope_autonomous_disjoint.pt"
+    if not spatial_ckpt.exists():
+        spatial_ckpt = rigor_dir / "spatial_scope_autonomous_disjoint.pt"
 
     model_tscope = TemporalSCOPE(base_ch=48, num_families=4, cond_dim=64, qg_size=16, max_delta_qp=6.0)
     if tscope_ckpt.exists():

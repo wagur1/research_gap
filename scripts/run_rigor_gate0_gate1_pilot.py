@@ -319,6 +319,12 @@ def main() -> None:
         default="",
         help="Optional warm-start checkpoint. Leave empty (default) to train from clean scratch on disjoint Train split (R09).",
     )
+    parser.add_argument(
+        "--spatial_init_ckpt",
+        type=str,
+        default="",
+        help="Optional spatial-only checkpoint trained on disjoint Train split.",
+    )
     parser.add_argument("--output_dir", type=str, default="./outputs_rigor_gate0_gate1")
     parser.add_argument("--img_size", type=int, default=256)
     parser.add_argument("--finetune_epochs", type=int, default=15)
@@ -375,6 +381,7 @@ def main() -> None:
 
     # 3. Train autonomous Temporal T-SCOPE and Spatial-Only SCOPE from clean scratch (`seed=2026`) on the 5 Train sequences
     init_ckpt_path = Path(args.init_ckpt) if args.init_ckpt else None
+    spatial_init_path = Path(args.spatial_init_ckpt) if args.spatial_init_ckpt else init_ckpt_path
     tscope_ckpt = out_dir / "tscope_autonomous_disjoint.pt"
     spatial_ckpt = out_dir / "spatial_scope_autonomous_disjoint.pt"
     print(
@@ -396,7 +403,7 @@ def main() -> None:
         train_ds,
         evaluator,
         cached_teacher_fpn,
-        init_ckpt_path,
+        spatial_init_path,
         spatial_ckpt,
         disable_temporal=True,
         epochs=args.finetune_epochs,

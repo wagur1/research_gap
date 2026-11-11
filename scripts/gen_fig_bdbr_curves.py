@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
 Generates IEEE TCSVT Rate-Distortion / Rate-Accuracy (BD-Rate) curves and
-Zero-Shot Cross-Detector bar chart directly from the verified Gate 0 + Gate 1
-real-`libx265` evidence bundle (`outputs_rigor_gate0_gate1/rigor_gate0_gate1_report.json`)
-and real-`libx265` cross-detector bundle (`outputs_rigor_gate0_gate1/cross_backbone_bdbr.json`)
-(`R02` & `R11` fix: zero proxy bpp, zero oracle mask leakage, zero synthetic mAP formulas).
+Ablation / Cross-Detector bar chart directly from the verified full-scale
+Kaggle disjoint-split real-`libx265` evidence bundle
+(`outputs_rigor_gate0_gate1/kaggle_21shards_disjoint_summary.json`)
+(`R02` & `R11` fix: 100% real libx265 + ffprobe pkt_size + gt/gt.txt AP, zero GT at inference).
 """
 import json
 import shutil
@@ -46,7 +46,8 @@ plt.rcParams.update(
 COLOR_ANCHOR = "#5C6B73"   # Slate Gray (Anchor libx265)
 COLOR_DET_EMA = "#8E9AAF"  # Cool Gray (Deterministic Blur+EMA)
 COLOR_SPATIAL = "#0072B2"  # Blue (Learned Spatial-Only SCOPE)
-COLOR_PREONLY = "#2A9D8F"  # Teal (Learned T-SCOPE Pre-Edit Only)
+COLOR_PREONLY = "#2A9D8F"  # Teal (T-SCOPE w/o CTU Delta-QP)
+COLOR_IWA = "#E9C46A"      # Gold (T-SCOPE IWA-GOP QP Reuse)
 COLOR_OURS = "#E76F51"     # Burnt Coral (Learned Full T-SCOPE)
 COLOR_ORACLE = "#6D597A"   # Muted Purple (Oracle GT-Mask Bound)
 
@@ -58,13 +59,12 @@ def extract_curve(summary_dict, method_key, qps):
         "total_bpp": np.array([pqp[str(q)]["total_bpp"] for q in qps], dtype=np.float64),
         "p_bpp": np.array([pqp[str(q)]["p_frame_bpp"] for q in qps], dtype=np.float64),
         "roi_psnr": np.array([pqp[str(q)]["roi_psnr_db"] for q in qps], dtype=np.float64),
-        "fpn_cos": np.array([pqp[str(q)]["fpn_cos_pct"] for q in qps], dtype=np.float64),
-        "gt_ap50": np.array([pqp[str(q)]["dataset_gt_ap50_pct"] for q in qps], dtype=np.float64),
-        "gt_ap95": np.array([pqp[str(q)]["dataset_gt_ap50_95_pct"] for q in qps], dtype=np.float64),
-        "bdbr_tot_psnr": m["real_total_bdbr_roi_psnr_pct"],
-        "bdbr_p_psnr": m["real_p_frame_bdbr_roi_psnr_pct"],
-        "bdbr_gt_ap50": m["real_total_bdbr_gt_ap50_pct"],
-        "bdbr_gt_ap95": m["real_total_bdbr_gt_ap50_95_pct"],
+        "gt_ap50": np.array([pqp[str(q)]["gt_ap50_pct"] for q in qps], dtype=np.float64),
+        "gt_ap95": np.array([pqp[str(q)]["gt_ap50_95_pct"] for q in qps], dtype=np.float64),
+        "bdbr_tot_gt50": m["bdbr_tot_gt_ap50_pct"],
+        "bdbr_p_gt50": m["bdbr_p_gt_ap50_pct"],
+        "bdbr_tot_gt95": m["bdbr_tot_gt_ap50_95_pct"],
+        "bdbr_p_gt95": m["bdbr_p_gt_ap50_95_pct"],
     }
 
 
@@ -72,145 +72,50 @@ def main() -> None:
     VIS_DIR.mkdir(parents=True, exist_ok=True)
     DOCS_FIG_DIR.mkdir(parents=True, exist_ok=True)
 
-    report_path = RIGOR_DIR / "rigor_gate0_gate1_report.json"
-    cross_path = RIGOR_DIR / "cross_backbone_bdbr.json"
-    if not report_path.exists():
-        raise FileNotFoundError(f"Missing verified Gate 0/1 report: {report_path}")
+    k_path = RIGOR_DIR / "kaggle_21shards_disjoint_summary.json"
+    if not k_path.exists():
+        raise FileNotFoundError(f"Missing Kaggle disjoint summary: {k_path}")
 
-    report = json.load(open(report_path, "r", encoding="utf-8"))
-    g1 = report["gate1_summary"]
-    qps = report["provenance"]["qps"]
+    bundle = json.load(open(k_path, "r", encoding="utf-8"))
+    overall = bundle["overall_methods_summary"]
+    ablation = bundle["ablation_variants_summary"]
+    qps = [27, 32, 37, 42, 47]
 
-    a = extract_curve(g1, "1_anchor_x265", qps)
-    d = extract_curve(g1, "3_deterministic_blur_ema", qps)
-    s = extract_curve(g1, "5_learned_spatial_scope", qps)
-    w = extract_curve(g1, "6_learned_tscope_preedit_only", qps)
-    f = extract_curve(g1, "7_learned_tscope_full", qps)
-    o = extract_curve(g1, "8_oracle_gt_mask_bound", qps)
+    a = extract_curve(overall, "anchor_x265", qps)
+    d = extract_curve(overall, "deterministic_blur_ema", qps)
+    s = extract_curve(overall, "spatial_scope_framewise", qps)
+    f = extract_curve(ablation, "full_tscope", qps)
+    w = extract_curve(ablation, "wo_ctu_delta_qp", qps)
+    o = extract_curve(overall, "oracle_gt_mask_upper_bound", qps)
 
     fig, axes = plt.subplots(2, 2, figsize=(11.8, 8.8))
     plt.subplots_adjust(wspace=0.24, hspace=0.33)
 
     # -------------------------------------------------------------------------
-    # Panel (a): Real libx265 Total Bitrate (BPP) vs. Task ROI-PSNR (dB)
+    # Panel (a): Real libx265 Total Bitrate (BPP) vs. Ground-Truth AP@50 (%)
     # -------------------------------------------------------------------------
     ax = axes[0, 0]
-    ax.plot(a["total_bpp"], a["roi_psnr"], "--o", color=COLOR_ANCHOR, label="1. Anchor libx265 (0.00%)")
+    ax.plot(a["total_bpp"], a["gt_ap50"], "--o", color=COLOR_ANCHOR, label="1. Anchor libx265 (0.00% BDBR)")
     ax.plot(
         d["total_bpp"],
-        d["roi_psnr"],
+        d["gt_ap50"],
         ":v",
         color=COLOR_DET_EMA,
-        label=f"3. Determ. Blur+EMA ({d['bdbr_tot_psnr']:+.2f}% BDBR)",
-    )
-    ax.plot(
-        s["total_bpp"],
-        s["roi_psnr"],
-        "-.s",
-        color=COLOR_SPATIAL,
-        label=f"5. Learned Spatial SCOPE ({s['bdbr_tot_psnr']:+.2f}% BDBR)",
+        label=f"2. Determ. Blur+EMA ({d['bdbr_tot_gt50']:+.2f}% BDBR)",
     )
     ax.plot(
         w["total_bpp"],
-        w["roi_psnr"],
+        w["gt_ap50"],
         ":^",
         color=COLOR_PREONLY,
-        label=f"6. T-SCOPE Pre-Edit Only ({w['bdbr_tot_psnr']:+.2f}% BDBR)",
+        label=f"3. T-SCOPE w/o CTU ΔQP ({w['bdbr_tot_gt50']:+.2f}% BDBR)",
     )
-    ax.plot(
-        f["total_bpp"],
-        f["roi_psnr"],
-        "-D",
-        color=COLOR_OURS,
-        linewidth=2.4,
-        label=f"7. Learned Full T-SCOPE ({f['bdbr_tot_psnr']:+.2f}% BDBR)",
-    )
-    ax.plot(
-        o["total_bpp"],
-        o["roi_psnr"],
-        "--*",
-        color=COLOR_ORACLE,
-        alpha=0.8,
-        label=f"8. Oracle GT-Mask Bound ({o['bdbr_tot_psnr']:+.2f}% BDBR)",
-    )
-
-    for qp, x_pt, y_pt in zip(qps, f["total_bpp"], f["roi_psnr"]):
-        ax.annotate(
-            f"CRF{qp}",
-            (x_pt, y_pt),
-            textcoords="offset points",
-            xytext=(-14, 5),
-            fontsize=7.2,
-            color="#B23A22",
-            weight="bold",
-        )
-
-    ax.set_title("(a) Real libx265 Total BPP vs. Task ROI-PSNR (Held-Out MOT17-11 & 13)")
-    ax.set_xlabel("Real libx265 Bitrate via ffprobe (bpp) $\\leftarrow$ Lower is Better")
-    ax.set_ylabel("Task Region PSNR inside $M_{\\mathrm{det}}$ (dB) $\\rightarrow$")
-    ax.legend(loc="lower right")
-
-    # -------------------------------------------------------------------------
-    # Panel (b): Real libx265 P-Frame Bitrate vs. Task ROI-PSNR (dB)
-    # -------------------------------------------------------------------------
-    ax = axes[0, 1]
-    ax.plot(a["p_bpp"], a["roi_psnr"], "--o", color=COLOR_ANCHOR, label="1. Anchor libx265 (0.00% P-BDBR)")
-    ax.plot(
-        d["p_bpp"],
-        d["roi_psnr"],
-        ":v",
-        color=COLOR_DET_EMA,
-        label=f"3. Determ. Blur+EMA ({d['bdbr_p_psnr']:+.2f}% P-BDBR)",
-    )
-    ax.plot(
-        s["p_bpp"],
-        s["roi_psnr"],
-        "-.s",
-        color=COLOR_SPATIAL,
-        label=f"5. Learned Spatial SCOPE ({s['bdbr_p_psnr']:+.2f}% P-BDBR)",
-    )
-    ax.plot(
-        w["p_bpp"],
-        w["roi_psnr"],
-        ":^",
-        color=COLOR_PREONLY,
-        label=f"6. T-SCOPE Pre-Edit Only ({w['bdbr_p_psnr']:+.2f}% P-BDBR)",
-    )
-    ax.plot(
-        f["p_bpp"],
-        f["roi_psnr"],
-        "-D",
-        color=COLOR_OURS,
-        linewidth=2.4,
-        label=f"7. Learned Full T-SCOPE ({f['bdbr_p_psnr']:+.2f}% P-BDBR)",
-    )
-    ax.plot(
-        o["p_bpp"],
-        o["roi_psnr"],
-        "--*",
-        color=COLOR_ORACLE,
-        alpha=0.8,
-        label=f"8. Oracle GT-Mask Bound ({o['bdbr_p_psnr']:+.2f}% P-BDBR)",
-    )
-
-    ax.set_title("(b) Real libx265 Inter-Frame (P-Frame) BPP vs. Task ROI-PSNR")
-    ax.set_xlabel("Real P-Frame Bitrate via ffprobe (bpp) $\\leftarrow$ Lower is Better")
-    ax.set_ylabel("Task Region PSNR inside $M_{\\mathrm{det}}$ (dB) $\\rightarrow$")
-    ax.legend(loc="lower right")
-
-    # -------------------------------------------------------------------------
-    # Panel (c): Official Dataset-Level Ground-Truth AP@50 & AP@[.5:.95] vs. Real BPP
-    # -------------------------------------------------------------------------
-    ax = axes[1, 0]
-    ap50_tag = f"{f['bdbr_gt_ap50']:+.2f}%" if f["bdbr_gt_ap50"] is not None else "N/A"
-    s_ap50_tag = f"{s['bdbr_gt_ap50']:+.2f}%" if s["bdbr_gt_ap50"] is not None else "N/A"
-    ax.plot(a["total_bpp"], a["gt_ap50"], "--o", color=COLOR_ANCHOR, label="1. Anchor libx265 (Dataset GT AP@50)")
     ax.plot(
         s["total_bpp"],
         s["gt_ap50"],
         "-.s",
         color=COLOR_SPATIAL,
-        label=f"5. Spatial SCOPE (GT AP@50 BDBR: {s_ap50_tag})",
+        label=f"4. Learned Spatial SCOPE ({s['bdbr_tot_gt50']:+.2f}% BDBR)",
     )
     ax.plot(
         f["total_bpp"],
@@ -218,77 +123,173 @@ def main() -> None:
         "-D",
         color=COLOR_OURS,
         linewidth=2.4,
-        label=f"7. Full T-SCOPE (GT AP@50 BDBR: {ap50_tag})",
+        label=f"5. Full T-SCOPE Ours ({f['bdbr_tot_gt50']:+.2f}% BDBR)",
     )
     ax.plot(
         o["total_bpp"],
         o["gt_ap50"],
         "--*",
         color=COLOR_ORACLE,
-        alpha=0.8,
-        label="8. Oracle GT-Mask (Dataset GT AP@50)",
+        alpha=0.82,
+        label=f"6. Oracle GT-Mask Bound ({o['bdbr_tot_gt50']:+.2f}% BDBR)",
     )
 
-    ax.set_title("(c) Official Dataset-Level Pedestrian GT AP@50 vs. Real libx265 BPP")
+    for qp, x_pt, y_pt in zip(qps, f["total_bpp"], f["gt_ap50"]):
+        ax.annotate(
+            f"CRF{qp}",
+            (x_pt, y_pt),
+            textcoords="offset points",
+            xytext=(-16, 5),
+            fontsize=7.2,
+            color="#B23A22",
+            weight="bold",
+        )
+
+    ax.set_title("(a) Real libx265 Total BPP vs. Pedestrian GT AP@50 (Held-Out MOT17-11 & 13)")
     ax.set_xlabel("Real libx265 Bitrate via ffprobe (bpp) $\\leftarrow$ Lower is Better")
-    ax.set_ylabel("Dataset-Level Ground-Truth AP@50 (%) $\\rightarrow$")
+    ax.set_ylabel("Ground-Truth Pedestrian AP@50 (%) $\\rightarrow$")
     ax.legend(loc="lower right")
 
     # -------------------------------------------------------------------------
-    # Panel (d): Zero-Shot Cross-Detector Real-x265 Generalization BDBR (%)
+    # Panel (b): Real libx265 P-Frame Bitrate vs. Ground-Truth AP@50 (%)
+    # -------------------------------------------------------------------------
+    ax = axes[0, 1]
+    ax.plot(a["p_bpp"], a["gt_ap50"], "--o", color=COLOR_ANCHOR, label="1. Anchor libx265 (0.00% P-BDBR)")
+    ax.plot(
+        d["p_bpp"],
+        d["gt_ap50"],
+        ":v",
+        color=COLOR_DET_EMA,
+        label=f"2. Determ. Blur+EMA ({d['bdbr_p_gt50']:+.2f}% P-BDBR)",
+    )
+    ax.plot(
+        w["p_bpp"],
+        w["gt_ap50"],
+        ":^",
+        color=COLOR_PREONLY,
+        label=f"3. T-SCOPE w/o CTU ΔQP ({w['bdbr_p_gt50']:+.2f}% P-BDBR)",
+    )
+    ax.plot(
+        s["p_bpp"],
+        s["gt_ap50"],
+        "-.s",
+        color=COLOR_SPATIAL,
+        label=f"4. Learned Spatial SCOPE ({s['bdbr_p_gt50']:+.2f}% P-BDBR)",
+    )
+    ax.plot(
+        f["p_bpp"],
+        f["gt_ap50"],
+        "-D",
+        color=COLOR_OURS,
+        linewidth=2.4,
+        label=f"5. Full T-SCOPE Ours ({f['bdbr_p_gt50']:+.2f}% P-BDBR)",
+    )
+    ax.plot(
+        o["p_bpp"],
+        o["gt_ap50"],
+        "--*",
+        color=COLOR_ORACLE,
+        alpha=0.82,
+        label=f"6. Oracle GT-Mask Bound ({o['bdbr_p_gt50']:+.2f}% P-BDBR)",
+    )
+
+    ax.set_title("(b) Real libx265 Inter-Frame (P-Frame) BPP vs. GT AP@50")
+    ax.set_xlabel("Real P-Frame Bitrate via ffprobe (bpp) $\\leftarrow$ Lower is Better")
+    ax.set_ylabel("Ground-Truth Pedestrian AP@50 (%) $\\rightarrow$")
+    ax.legend(loc="lower right")
+
+    # -------------------------------------------------------------------------
+    # Panel (c): Real libx265 Total Bitrate vs. Strict COCO GT AP@[.50:.95] (%)
+    # -------------------------------------------------------------------------
+    ax = axes[1, 0]
+    ax.plot(a["total_bpp"], a["gt_ap95"], "--o", color=COLOR_ANCHOR, label="1. Anchor libx265 (0.00% BDBR)")
+    ax.plot(
+        w["total_bpp"],
+        w["gt_ap95"],
+        ":^",
+        color=COLOR_PREONLY,
+        label=f"3. T-SCOPE w/o CTU ΔQP ({w['bdbr_tot_gt95']:+.2f}% BDBR)",
+    )
+    ax.plot(
+        s["total_bpp"],
+        s["gt_ap95"],
+        "-.s",
+        color=COLOR_SPATIAL,
+        label=f"4. Learned Spatial SCOPE ({s['bdbr_tot_gt95']:+.2f}% BDBR)",
+    )
+    ax.plot(
+        f["total_bpp"],
+        f["gt_ap95"],
+        "-D",
+        color=COLOR_OURS,
+        linewidth=2.4,
+        label=f"5. Full T-SCOPE Ours ({f['bdbr_tot_gt95']:+.2f}% BDBR)",
+    )
+    ax.plot(
+        o["total_bpp"],
+        o["gt_ap95"],
+        "--*",
+        color=COLOR_ORACLE,
+        alpha=0.82,
+        label=f"6. Oracle GT-Mask Bound ({o['bdbr_tot_gt95']:+.2f}% BDBR)",
+    )
+
+    ax.set_title("(c) Real libx265 Total BPP vs. Strict COCO GT AP@[.50:.95]")
+    ax.set_xlabel("Real libx265 Bitrate via ffprobe (bpp) $\\leftarrow$ Lower is Better")
+    ax.set_ylabel("Ground-Truth COCO AP@[.50:.95] (%) $\\rightarrow$")
+    ax.legend(loc="lower right")
+
+    # -------------------------------------------------------------------------
+    # Panel (d): 5-Variant Ablation Study on Disjoint Held-Out MOT17-11 & 13
     # -------------------------------------------------------------------------
     ax = axes[1, 1]
-    if cross_path.exists():
-        cross_bb = json.load(open(cross_path, "r", encoding="utf-8"))
-        bb_keys = [
-            "fasterrcnn_r50_fpn_v2",
-            "retinanet_r50_fpn_v2",
-            "fcos_r50_fpn",
-            "ssdlite_mobilenet_v3",
-            "swin_t_transformer",
-        ]
-        bb_short = [
-            "Faster R-CNN\n(Teacher Det)",
-            "RetinaNet\n(Zero-Shot Det)",
-            "FCOS\n(Zero-Shot Det)",
-            "SSDLite\n(Zero-Shot Det)",
-            "Swin-T\n(Feat Backbone)",
-        ]
-        x = np.arange(len(bb_keys))
-        width = 0.26
+    var_keys = [
+        "wo_ctu_delta_qp",
+        "spatial_only_scope",
+        "proxy_only_zhao",
+        "iwa_gop_qp_reuse",
+        "full_tscope",
+    ]
+    var_labels = [
+        "w/o CTU\nΔQP",
+        "Spatial-Only\nSCOPE",
+        "Proxy-Only\n(No STE)",
+        "IWA-GOP\nQP Reuse",
+        "Full T-SCOPE\n(Ours)",
+    ]
+    x = np.arange(len(var_keys))
+    width = 0.26
 
-        s_vals = [cross_bb[k]["spatial_scope_total_bdbr_feat_snr_pct"] for k in bb_keys]
-        t_tot_vals = [cross_bb[k]["tscope_total_bdbr_feat_snr_pct"] for k in bb_keys]
-        t_p_vals = [cross_bb[k]["tscope_p_bdbr_feat_snr_pct"] for k in bb_keys]
+    tot_ap50 = [ablation[k]["bdbr_tot_gt_ap50_pct"] for k in var_keys]
+    p_ap50 = [ablation[k]["bdbr_p_gt_ap50_pct"] for k in var_keys]
+    tot_ap95 = [ablation[k]["bdbr_tot_gt_ap50_95_pct"] for k in var_keys]
 
-        b1 = ax.bar(x - width, s_vals, width, label="Spatial SCOPE (Total BDBR)", color=COLOR_SPATIAL, alpha=0.85)
-        b2 = ax.bar(x, t_tot_vals, width, label="Full T-SCOPE (Total BDBR)", color=COLOR_OURS)
-        b3 = ax.bar(x + width, t_p_vals, width, label="Full T-SCOPE (P-Frame BDBR)", color=COLOR_PREONLY)
+    b1 = ax.bar(x - width, tot_ap50, width, label="Total BDBR (GT AP@50)", color=COLOR_OURS)
+    b2 = ax.bar(x, p_ap50, width, label="P-Frame BDBR (GT AP@50)", color=COLOR_SPATIAL, alpha=0.88)
+    b3 = ax.bar(x + width, tot_ap95, width, label="Total BDBR (GT AP@[.5:.95])", color=COLOR_PREONLY)
 
-        ax.axhline(0.0, color="#333333", linewidth=1.0, linestyle="-")
-        for bars in (b1, b2, b3):
-            for bar in bars:
-                h_val = bar.get_height()
-                va = "bottom" if h_val >= 0 else "top"
-                y_off = 0.6 if h_val >= 0 else -1.0
-                ax.text(
-                    bar.get_x() + bar.get_width() / 2.0,
-                    h_val + y_off,
-                    f"{h_val:+.1f}%",
-                    ha="center",
-                    va=va,
-                    fontsize=6.6,
-                    weight="bold",
-                    color="#222222",
-                )
-        ax.set_xticks(x)
-        ax.set_xticklabels(bb_short, fontsize=8.2)
-        min_v = min(min(s_vals), min(t_tot_vals), min(t_p_vals), -25.0)
-        max_v = max(max(s_vals), max(t_tot_vals), max(t_p_vals), 10.0)
-        ax.set_ylim(min_v - 8.0, max_v + 8.0)
-        ax.set_title("(d) Zero-Shot Cross-Detector Real-x265 BDBR (%) (Held-Out Split)")
-        ax.set_ylabel("Real libx265 BDBR (%) $\\leftarrow$ Lower is Better")
-        ax.legend(loc="lower left", ncol=1, fontsize=7.4)
+    ax.axhline(0.0, color="#333333", linewidth=1.0, linestyle="-")
+    for bars in (b1, b2, b3):
+        for bar in bars:
+            h_val = bar.get_height()
+            va = "bottom" if h_val >= 0 else "top"
+            y_off = 0.5 if h_val >= 0 else -0.8
+            ax.text(
+                bar.get_x() + bar.get_width() / 2.0,
+                h_val + y_off,
+                f"{h_val:+.1f}%",
+                ha="center",
+                va=va,
+                fontsize=6.5,
+                weight="bold",
+                color="#222222",
+            )
+    ax.set_xticks(x)
+    ax.set_xticklabels(var_labels, fontsize=8.3)
+    ax.set_ylim(-32.0, 5.0)
+    ax.set_title("(d) 5-Variant Ablation BDBR (%) on Held-Out MOT17-11 & 13 (Real libx265)")
+    ax.set_ylabel("Real libx265 BDBR (%) $\\leftarrow$ Lower is Better")
+    ax.legend(loc="lower left", ncol=1, fontsize=7.4)
 
     png_path = VIS_DIR / "fig_bdbr_curves.png"
     pdf_path = VIS_DIR / "fig_bdbr_curves.pdf"
@@ -296,7 +297,7 @@ def main() -> None:
     fig.savefig(pdf_path)
     shutil.copyfile(png_path, DOCS_FIG_DIR / "fig_bdbr_curves.png")
     shutil.copyfile(pdf_path, DOCS_FIG_DIR / "fig_bdbr_curves.pdf")
-    print(f"Saved verified real-x265 BD-Rate curves -> {png_path} and {pdf_path}")
+    print(f"Saved full-scale disjoint real-x265 BD-Rate curves -> {png_path} and {pdf_path}")
 
 
 if __name__ == "__main__":
