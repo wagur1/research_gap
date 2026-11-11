@@ -183,20 +183,22 @@ def main() -> None:
     ax.annotate(
         "Temporal Flicker Penalty\n(+3.8% P-bits at QP=27)",
         xy=(s["p_bpp"][0], s["roi_psnr"][0]),
-        xytext=(s["p_bpp"][0] - 0.21, s["roi_psnr"][0] - 3.6),
-        arrowprops=dict(arrowstyle="->", color=COLOR_SPATIAL, lw=1.2),
-        fontsize=8,
+        xytext=(0.35, 31.8),
+        arrowprops=dict(arrowstyle="->", color=COLOR_SPATIAL, lw=1.2, connectionstyle="arc3,rad=-0.15"),
+        fontsize=7.8,
         color=COLOR_SPATIAL,
         weight="bold",
+        bbox=dict(boxstyle="round,pad=0.2", fc="white", ec=COLOR_SPATIAL, alpha=0.88, lw=0.8),
     )
     ax.annotate(
         "-42.5% P-Frame Bits\n& +0.69 dB ROI-PSNR",
         xy=(f["p_bpp"][0], f["roi_psnr"][0]),
-        xytext=(f["p_bpp"][0] - 0.02, f["roi_psnr"][0] - 4.2),
+        xytext=(0.11, 38.2),
         arrowprops=dict(arrowstyle="->", color=COLOR_OURS, lw=1.2),
-        fontsize=8,
+        fontsize=7.8,
         color="#B23A22",
         weight="bold",
+        bbox=dict(boxstyle="round,pad=0.2", fc="white", ec=COLOR_OURS, alpha=0.88, lw=0.8),
     )
 
     ax.set_title("(b) Inter-Frame (P-Frame) Bitrate vs. Task ROI Fidelity")
@@ -283,10 +285,10 @@ def main() -> None:
 
     ax.set_xticks(x)
     ax.set_xticklabels(bb_short, fontsize=8.5)
-    ax.set_ylim(-62.0, 14.0)
+    ax.set_ylim(-68.0, 15.0)
     ax.set_title("(d) Zero-Shot Cross-Backbone BDBR (%) (Single Trained Model)")
     ax.set_ylabel("Bjontegaard Delta Rate - BDBR (%) $\\leftarrow$ Lower is Better")
-    ax.legend(loc="lower left", fontsize=7.8)
+    ax.legend(loc="lower left", ncol=1, fontsize=7.4)
 
     png_path = VIS_DIR / "fig_bdbr_curves.png"
     pdf_path = VIS_DIR / "fig_bdbr_curves.pdf"
