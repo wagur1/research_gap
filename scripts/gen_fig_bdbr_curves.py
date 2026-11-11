@@ -1,303 +1,261 @@
 #!/usr/bin/env python3
+"""Plot only a schema-v2, final-ready merged benchmark; never legacy evidence.
+
+No input/output defaults or copying into the manuscript are provided. Validation
+is dependency-light so --validate-only and input tests do not render figures.
 """
-Generates IEEE TCSVT Rate-Distortion / Rate-Accuracy (BD-Rate) curves and
-Ablation / Cross-Detector bar chart directly from the verified full-scale
-Kaggle disjoint-split real-`libx265` evidence bundle
-(`outputs_rigor_gate0_gate1/kaggle_21shards_disjoint_summary.json`)
-(`R02` & `R11` fix: 100% real libx265 + ffprobe pkt_size + gt/gt.txt AP, zero GT at inference).
-"""
+import argparse
 import json
-import shutil
+import math
 from pathlib import Path
 
-import matplotlib.pyplot as plt
-import numpy as np
+EXPECTED_CRFS = [22, 27, 32, 37]
+PRESERVED_CODEC_SETTINGS = {
+    "qg_size": 16,
+    "actual_roi_grid_max": 8,
+    "positive_qoffset_cap": 0.06,
+    "negative_qoffset_cap": -0.18,
+}
+CURVE_FIELDS = {
+    "total_bpp": "total_bpp",
+    "p_bpp": "p_frame_bpp",
+    "roi_psnr": "roi_psnr_db",
+    "gt_ap50": "gt_ap50_pct",
+    "gt_ap95": "gt_ap50_95_pct",
+}
+BDBR_FIELDS = {
+    "bdbr_tot_gt50": "bdbr_tot_gt_ap50_pct",
+    "bdbr_p_gt50": "bdbr_p_gt_ap50_pct",
+    "bdbr_tot_gt95": "bdbr_tot_gt_ap50_95_pct",
+    "bdbr_p_gt95": "bdbr_p_gt_ap50_95_pct",
+}
+METHOD_LABELS = {
+    "anchor_x265": "Anchor libx265",
+    "deterministic_blur_ema": "Deterministic blur + EMA (non-learned)",
+    "spatial_scope_framewise": "Framewise spatial (proxy-trained, no QG offsets)",
+    "tscope_temporal_ctu_qp": "Full T-SCOPE (per-frame QG offsets)",
+    "oracle_gt_mask_upper_bound": "Oracle GT mask (uses GT; not deployable)",
+}
+VARIANT_LABELS = {
+    "wo_ctu_delta_qp": "T-SCOPE without QG offsets",
+    "spatial_only_scope": "Spatial: framewise, proxy-trained, no QG offsets",
+    "proxy_only_zhao": "Internal proxy-trained baseline (not prior-art reproduction)",
+    "iwa_gop_qp_reuse": "T-SCOPE with I-frame QG map reuse",
+    "full_tscope": "Full T-SCOPE (per-frame QG offsets)",
+}
+COLORS = ["#666666", "#E69F00", "#0072B2", "#D55E00", "#CC79A7"]
+MARKERS = ["o", "v", "s", "D", "*"]
 
-ROOT_DIR = Path(__file__).resolve().parent.parent
-RIGOR_DIR = ROOT_DIR / "outputs_rigor_gate0_gate1"
-VIS_DIR = ROOT_DIR / "outputs_kaggle_pool_full" / "visuals"
-DOCS_FIG_DIR = ROOT_DIR / "docs" / "figures"
 
-plt.rcParams.update(
-    {
-        "font.family": "serif",
-        "font.serif": ["Times New Roman", "DejaVu Serif"],
-        "font.size": 10,
-        "axes.titlesize": 10.5,
-        "axes.titleweight": "bold",
-        "axes.labelsize": 9.8,
-        "legend.fontsize": 7.8,
-        "legend.frameon": True,
-        "legend.framealpha": 0.92,
-        "legend.edgecolor": "#E0E0E0",
-        "figure.dpi": 300,
-        "savefig.dpi": 300,
-        "savefig.bbox": "tight",
-        "axes.spines.top": False,
-        "axes.spines.right": False,
-        "axes.grid": True,
-        "grid.alpha": 0.22,
-        "grid.linestyle": "--",
-        "lines.linewidth": 2.0,
-        "lines.markersize": 6,
-    }
-)
+class PlotInputError(ValueError):
+    """Evidence is not eligible for final figures."""
 
-COLOR_ANCHOR = "#5C6B73"   # Slate Gray (Anchor libx265)
-COLOR_DET_EMA = "#8E9AAF"  # Cool Gray (Deterministic Blur+EMA)
-COLOR_SPATIAL = "#0072B2"  # Blue (Learned Spatial-Only SCOPE)
-COLOR_PREONLY = "#2A9D8F"  # Teal (T-SCOPE w/o CTU Delta-QP)
-COLOR_IWA = "#E9C46A"      # Gold (T-SCOPE IWA-GOP QP Reuse)
-COLOR_OURS = "#E76F51"     # Burnt Coral (Learned Full T-SCOPE)
-COLOR_ORACLE = "#6D597A"   # Muted Purple (Oracle GT-Mask Bound)
+
+def _object(value, context):
+    if not isinstance(value, dict):
+        raise PlotInputError(f"{context}: expected an object")
+    return value
+
+
+def _finite(value, context):
+    # JSON numeric strings, booleans, NaN and infinities are not measurements.
+    if type(value) not in (int, float) or not math.isfinite(value):
+        raise PlotInputError(f"{context}: expected a finite numeric measurement, got {value!r}")
+    return float(value)
+
+
+def validate_crfs(crfs):
+    if (not isinstance(crfs, list) or any(type(q) is not int for q in crfs)
+            or crfs != EXPECTED_CRFS):
+        raise PlotInputError(f"crfs: expected the actual protocol {EXPECTED_CRFS}, got {crfs!r}")
+    return list(crfs)
 
 
 def extract_curve(summary_dict, method_key, qps):
-    m = summary_dict[method_key]
-    pqp = m["per_qp"]
-    return {
-        "total_bpp": np.array([pqp[str(q)]["total_bpp"] for q in qps], dtype=np.float64),
-        "p_bpp": np.array([pqp[str(q)]["p_frame_bpp"] for q in qps], dtype=np.float64),
-        "roi_psnr": np.array([pqp[str(q)]["roi_psnr_db"] for q in qps], dtype=np.float64),
-        "gt_ap50": np.array([pqp[str(q)]["gt_ap50_pct"] for q in qps], dtype=np.float64),
-        "gt_ap95": np.array([pqp[str(q)]["gt_ap50_95_pct"] for q in qps], dtype=np.float64),
-        "bdbr_tot_gt50": m["bdbr_tot_gt_ap50_pct"],
-        "bdbr_p_gt50": m["bdbr_p_gt_ap50_pct"],
-        "bdbr_tot_gt95": m["bdbr_tot_gt_ap50_95_pct"],
-        "bdbr_p_gt95": m["bdbr_p_gt_ap50_95_pct"],
-    }
+    """Validate complete real curves and nullable BDBR; do not fit/fill data."""
+    qps = validate_crfs(qps)
+    summary_dict = _object(summary_dict, "summary")
+    if method_key not in summary_dict:
+        raise PlotInputError(f"summary: missing method {method_key!r}")
+    method = _object(summary_dict[method_key], method_key)
+    pqp = _object(method.get("per_qp"), f"{method_key}.per_qp")
+    if set(pqp) != {str(q) for q in qps}:
+        raise PlotInputError(f"{method_key}.per_qp: expected exactly string CRF keys {qps}")
+    curve = {key: [] for key in CURVE_FIELDS}
+    for q in qps:
+        row = _object(pqp[str(q)], f"{method_key}.per_qp[{q}]")
+        for target, field in CURVE_FIELDS.items():
+            value = _finite(row.get(field), f"{method_key}.CRF{q}.{field}")
+            if field in ("total_bpp", "p_frame_bpp") and value <= 0:
+                raise PlotInputError(f"{method_key}.CRF{q}.{field}: bitrate must be positive")
+            if field in ("gt_ap50_pct", "gt_ap50_95_pct") and not 0 <= value <= 100:
+                raise PlotInputError(f"{method_key}.CRF{q}.{field}: AP must be in [0, 100]")
+            curve[target].append(value)
+    reasons = _object(method.get("bdbr_unavailable_reasons", {}),
+                      f"{method_key}.bdbr_unavailable_reasons")
+    curve["bdbr_unavailable_reasons"] = {}
+    for target, field in BDBR_FIELDS.items():
+        if field not in method:
+            raise PlotInputError(f"{method_key}: missing {field}")
+        value = method[field]
+        if value is None:
+            reason = reasons.get(field)
+            if not isinstance(reason, str) or not reason.strip():
+                raise PlotInputError(f"{method_key}.{field}: null BDBR requires an unavailable reason")
+            curve[target] = None
+            curve["bdbr_unavailable_reasons"][target] = reason.strip()
+        else:
+            curve[target] = _finite(value, f"{method_key}.{field}")
+    return curve
 
 
-def main() -> None:
-    VIS_DIR.mkdir(parents=True, exist_ok=True)
-    DOCS_FIG_DIR.mkdir(parents=True, exist_ok=True)
+def validate_codec_settings(bundle):
+    configuration = _object(bundle.get("configuration"), "configuration")
+    codec = _object(configuration.get("codec"), "configuration.codec")
+    for key, expected in PRESERVED_CODEC_SETTINGS.items():
+        actual = _finite(codec.get(key), f"configuration.codec.{key}")
+        if actual != expected:
+            raise PlotInputError(f"configuration.codec.{key}: expected preserved setting {expected}, got {actual}")
+    return codec
 
-    k_path = RIGOR_DIR / "kaggle_21shards_disjoint_summary.json"
-    if not k_path.exists():
-        raise FileNotFoundError(f"Missing Kaggle disjoint summary: {k_path}")
 
-    bundle = json.load(open(k_path, "r", encoding="utf-8"))
-    overall = bundle["overall_methods_summary"]
-    ablation = bundle["ablation_variants_summary"]
-    qps = [27, 32, 37, 42, 47]
+def codec_caption(bundle):
+    codec = validate_codec_settings(bundle)
+    return (f"Model QG={codec['qg_size']} px; applied ROI grid <= "
+            f"{codec['actual_roi_grid_max']}x{codec['actual_roi_grid_max']} regions; "
+            f"qoffset caps [{codec['negative_qoffset_cap']:+.2f}, {codec['positive_qoffset_cap']:+.2f}]")
 
-    a = extract_curve(overall, "anchor_x265", qps)
-    d = extract_curve(overall, "deterministic_blur_ema", qps)
-    s = extract_curve(overall, "spatial_scope_framewise", qps)
-    f = extract_curve(ablation, "full_tscope", qps)
-    w = extract_curve(ablation, "wo_ctu_delta_qp", qps)
-    o = extract_curve(overall, "oracle_gt_mask_upper_bound", qps)
 
-    fig, axes = plt.subplots(2, 2, figsize=(11.8, 8.8))
-    plt.subplots_adjust(wspace=0.24, hspace=0.33)
+def validate_bundle(bundle):
+    bundle = _object(bundle, "benchmark")
+    if type(bundle.get("schema_version")) is not int or bundle["schema_version"] != 2:
+        raise PlotInputError("benchmark: schema_version=2 is required; legacy summaries are not accepted")
+    eligibility = _object(bundle.get("eligibility"), "eligibility")
+    if eligibility.get("final_ready") is not True:
+        raise PlotInputError("benchmark: eligibility.final_ready must be true; no partial/smoke-test figures")
+    crfs = validate_crfs(bundle.get("crfs"))
+    validate_codec_settings(bundle)
+    # The merge contract defines overall_methods_summary as the full cohort only.
+    # Never substitute an ablation shard summary for the full method curve.
+    for section, required in (("overall_methods_summary", METHOD_LABELS),
+                              ("ablation_variants_summary", VARIANT_LABELS)):
+        summary = _object(bundle.get(section), section)
+        for key in required:
+            extract_curve(summary, key, crfs)
+        for key in summary:
+            extract_curve(summary, key, crfs)
+    return bundle
 
-    # -------------------------------------------------------------------------
-    # Panel (a): Real libx265 Total Bitrate (BPP) vs. Ground-Truth AP@50 (%)
-    # -------------------------------------------------------------------------
-    ax = axes[0, 0]
-    ax.plot(a["total_bpp"], a["gt_ap50"], "--o", color=COLOR_ANCHOR, label="1. Anchor libx265 (0.00% BDBR)")
-    ax.plot(
-        d["total_bpp"],
-        d["gt_ap50"],
-        ":v",
-        color=COLOR_DET_EMA,
-        label=f"2. Determ. Blur+EMA ({d['bdbr_tot_gt50']:+.2f}% BDBR)",
-    )
-    ax.plot(
-        w["total_bpp"],
-        w["gt_ap50"],
-        ":^",
-        color=COLOR_PREONLY,
-        label=f"3. T-SCOPE w/o CTU ΔQP ({w['bdbr_tot_gt50']:+.2f}% BDBR)",
-    )
-    ax.plot(
-        s["total_bpp"],
-        s["gt_ap50"],
-        "-.s",
-        color=COLOR_SPATIAL,
-        label=f"4. Learned Spatial SCOPE ({s['bdbr_tot_gt50']:+.2f}% BDBR)",
-    )
-    ax.plot(
-        f["total_bpp"],
-        f["gt_ap50"],
-        "-D",
-        color=COLOR_OURS,
-        linewidth=2.4,
-        label=f"5. Full T-SCOPE Ours ({f['bdbr_tot_gt50']:+.2f}% BDBR)",
-    )
-    ax.plot(
-        o["total_bpp"],
-        o["gt_ap50"],
-        "--*",
-        color=COLOR_ORACLE,
-        alpha=0.82,
-        label=f"6. Oracle GT-Mask Bound ({o['bdbr_tot_gt50']:+.2f}% BDBR)",
-    )
 
-    for qp, x_pt, y_pt in zip(qps, f["total_bpp"], f["gt_ap50"]):
-        ax.annotate(
-            f"CRF{qp}",
-            (x_pt, y_pt),
-            textcoords="offset points",
-            xytext=(-16, 5),
-            fontsize=7.2,
-            color="#B23A22",
-            weight="bold",
-        )
+def load_benchmark(path):
+    path = Path(path)
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            bundle = json.load(handle)
+    except (OSError, ValueError) as exc:
+        raise PlotInputError(f"Cannot read merged benchmark {path}: {exc}") from exc
+    return validate_bundle(bundle)
 
-    ax.set_title("(a) Real libx265 Total BPP vs. Pedestrian GT AP@50 (Held-Out MOT17-11 & 13)")
-    ax.set_xlabel("Real libx265 Bitrate via ffprobe (bpp) $\\leftarrow$ Lower is Better")
-    ax.set_ylabel("Ground-Truth Pedestrian AP@50 (%) $\\rightarrow$")
-    ax.legend(loc="lower right")
 
-    # -------------------------------------------------------------------------
-    # Panel (b): Real libx265 P-Frame Bitrate vs. Ground-Truth AP@50 (%)
-    # -------------------------------------------------------------------------
-    ax = axes[0, 1]
-    ax.plot(a["p_bpp"], a["gt_ap50"], "--o", color=COLOR_ANCHOR, label="1. Anchor libx265 (0.00% P-BDBR)")
-    ax.plot(
-        d["p_bpp"],
-        d["gt_ap50"],
-        ":v",
-        color=COLOR_DET_EMA,
-        label=f"2. Determ. Blur+EMA ({d['bdbr_p_gt50']:+.2f}% P-BDBR)",
-    )
-    ax.plot(
-        w["p_bpp"],
-        w["gt_ap50"],
-        ":^",
-        color=COLOR_PREONLY,
-        label=f"3. T-SCOPE w/o CTU ΔQP ({w['bdbr_p_gt50']:+.2f}% P-BDBR)",
-    )
-    ax.plot(
-        s["p_bpp"],
-        s["gt_ap50"],
-        "-.s",
-        color=COLOR_SPATIAL,
-        label=f"4. Learned Spatial SCOPE ({s['bdbr_p_gt50']:+.2f}% P-BDBR)",
-    )
-    ax.plot(
-        f["p_bpp"],
-        f["gt_ap50"],
-        "-D",
-        color=COLOR_OURS,
-        linewidth=2.4,
-        label=f"5. Full T-SCOPE Ours ({f['bdbr_p_gt50']:+.2f}% P-BDBR)",
-    )
-    ax.plot(
-        o["p_bpp"],
-        o["gt_ap50"],
-        "--*",
-        color=COLOR_ORACLE,
-        alpha=0.82,
-        label=f"6. Oracle GT-Mask Bound ({o['bdbr_p_gt50']:+.2f}% P-BDBR)",
-    )
+def bdbr_text(curve, field):
+    value = curve[field]
+    if value is None:
+        return "BDBR unavailable: " + curve["bdbr_unavailable_reasons"][field]
+    return f"{value:+.2f}% BDBR"
 
-    ax.set_title("(b) Real libx265 Inter-Frame (P-Frame) BPP vs. GT AP@50")
-    ax.set_xlabel("Real P-Frame Bitrate via ffprobe (bpp) $\\leftarrow$ Lower is Better")
-    ax.set_ylabel("Ground-Truth Pedestrian AP@50 (%) $\\rightarrow$")
-    ax.legend(loc="lower right")
 
-    # -------------------------------------------------------------------------
-    # Panel (c): Real libx265 Total Bitrate vs. Strict COCO GT AP@[.50:.95] (%)
-    # -------------------------------------------------------------------------
-    ax = axes[1, 0]
-    ax.plot(a["total_bpp"], a["gt_ap95"], "--o", color=COLOR_ANCHOR, label="1. Anchor libx265 (0.00% BDBR)")
-    ax.plot(
-        w["total_bpp"],
-        w["gt_ap95"],
-        ":^",
-        color=COLOR_PREONLY,
-        label=f"3. T-SCOPE w/o CTU ΔQP ({w['bdbr_tot_gt95']:+.2f}% BDBR)",
-    )
-    ax.plot(
-        s["total_bpp"],
-        s["gt_ap95"],
-        "-.s",
-        color=COLOR_SPATIAL,
-        label=f"4. Learned Spatial SCOPE ({s['bdbr_tot_gt95']:+.2f}% BDBR)",
-    )
-    ax.plot(
-        f["total_bpp"],
-        f["gt_ap95"],
-        "-D",
-        color=COLOR_OURS,
-        linewidth=2.4,
-        label=f"5. Full T-SCOPE Ours ({f['bdbr_tot_gt95']:+.2f}% BDBR)",
-    )
-    ax.plot(
-        o["total_bpp"],
-        o["gt_ap95"],
-        "--*",
-        color=COLOR_ORACLE,
-        alpha=0.82,
-        label=f"6. Oracle GT-Mask Bound ({o['bdbr_tot_gt95']:+.2f}% BDBR)",
-    )
+def _style(plt):
+    plt.rcParams.update({
+        "font.family": "serif", "font.serif": ["Times New Roman", "DejaVu Serif"],
+        "font.size": 9, "legend.fontsize": 7, "legend.frameon": False,
+        "figure.dpi": 150, "savefig.dpi": 300, "savefig.bbox": "tight",
+        "axes.spines.top": False, "axes.spines.right": False,
+        "axes.grid": True, "grid.alpha": 0.15, "lines.linewidth": 1.8,
+    })
 
-    ax.set_title("(c) Real libx265 Total BPP vs. Strict COCO GT AP@[.50:.95]")
-    ax.set_xlabel("Real libx265 Bitrate via ffprobe (bpp) $\\leftarrow$ Lower is Better")
-    ax.set_ylabel("Ground-Truth COCO AP@[.50:.95] (%) $\\rightarrow$")
-    ax.legend(loc="lower right")
 
-    # -------------------------------------------------------------------------
-    # Panel (d): 5-Variant Ablation Study on Disjoint Held-Out MOT17-11 & 13
-    # -------------------------------------------------------------------------
-    ax = axes[1, 1]
-    var_keys = [
-        "wo_ctu_delta_qp",
-        "spatial_only_scope",
-        "proxy_only_zhao",
-        "iwa_gop_qp_reuse",
-        "full_tscope",
+def _save(fig, output_dir, stem, plt):
+    fig.savefig(output_dir / f"{stem}.pdf")
+    fig.savefig(output_dir / f"{stem}.png", dpi=300)
+    plt.close(fig)
+
+
+def render_figures(bundle, output_dir):
+    # Validate everything before importing rendering libraries or creating output.
+    validate_bundle(bundle)
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    _style(plt)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    crfs = bundle["crfs"]
+    curves = {k: extract_curve(bundle["overall_methods_summary"], k, crfs) for k in METHOD_LABELS}
+    panels = [
+        ("total_bpp", "gt_ap50", "bdbr_tot_gt50", "Total bitrate (bpp)", "GT AP@50 (%)"),
+        ("p_bpp", "gt_ap50", "bdbr_p_gt50", "P-frame bitrate (bpp)", "GT AP@50 (%)"),
+        ("total_bpp", "gt_ap95", "bdbr_tot_gt95", "Total bitrate (bpp)", "GT AP@[.50:.95] (%)"),
+        ("p_bpp", "gt_ap95", "bdbr_p_gt95", "P-frame bitrate (bpp)", "GT AP@[.50:.95] (%)"),
     ]
-    var_labels = [
-        "w/o CTU\nΔQP",
-        "Spatial-Only\nSCOPE",
-        "Proxy-Only\n(No STE)",
-        "IWA-GOP\nQP Reuse",
-        "Full T-SCOPE\n(Ours)",
-    ]
-    x = np.arange(len(var_keys))
-    width = 0.26
+    fig, axes = plt.subplots(2, 2, figsize=(12, 9), constrained_layout=True)
+    for ax, (xf, yf, bf, xl, yl) in zip(axes.flat, panels):
+        for idx, (key, label) in enumerate(METHOD_LABELS.items()):
+            curve = curves[key]
+            ax.plot(curve[xf], curve[yf], marker=MARKERS[idx], color=COLORS[idx],
+                    linestyle="--" if key == "anchor_x265" else "-",
+                    label=f"{label}\n{bdbr_text(curve, bf)}")
+            if key == "tscope_temporal_ctu_qp":
+                for q, x, y in zip(crfs, curve[xf], curve[yf]):
+                    ax.annotate(f"CRF {q}", (x, y), xytext=(4, 4), textcoords="offset points", fontsize=7)
+        ax.set_xlabel(xl + " (lower is better)")
+        ax.set_ylabel(yl)
+        ax.legend(loc="best")
+    fig.suptitle("Full-cohort held-out rate-accuracy curves (merged final-ready evidence)\n" + codec_caption(bundle), fontsize=10)
+    _save(fig, output_dir, "fig_bdbr_curves", plt)
 
-    tot_ap50 = [ablation[k]["bdbr_tot_gt_ap50_pct"] for k in var_keys]
-    p_ap50 = [ablation[k]["bdbr_p_gt_ap50_pct"] for k in var_keys]
-    tot_ap95 = [ablation[k]["bdbr_tot_gt_ap50_95_pct"] for k in var_keys]
+    variants = {k: extract_curve(bundle["ablation_variants_summary"], k, crfs) for k in VARIANT_LABELS}
+    fig, axes = plt.subplots(2, 2, figsize=(13, 10), constrained_layout=True)
+    for ax, (_, _, bf, xl, yl) in zip(axes.flat, panels):
+        unavailable = []
+        for idx, (key, label) in enumerate(VARIANT_LABELS.items()):
+            curve = variants[key]
+            value = curve[bf]
+            if value is None:
+                # No placeholder zero-height bar: unavailable is explicitly text.
+                ax.text(idx, 0.02, "N/A", transform=ax.get_xaxis_transform(), ha="center", fontsize=8)
+                unavailable.append(f"{key}: {curve['bdbr_unavailable_reasons'][bf]}")
+            else:
+                ax.bar(idx, value, color=COLORS[idx], width=0.65)
+                ax.annotate(f"{value:+.1f}%", (idx, value), xytext=(0, 3 if value >= 0 else -3),
+                            textcoords="offset points", ha="center", va="bottom" if value >= 0 else "top", fontsize=8)
+        ax.axhline(0, color="#333333", linewidth=0.8)
+        ax.set_xticks(np.arange(len(VARIANT_LABELS)))
+        ax.set_xticklabels(list(VARIANT_LABELS.values()), rotation=20, ha="right", fontsize=7)
+        ax.set_ylabel(f"{xl.split(' (')[0]} BDBR at {yl} (%)")
+        ax.margins(y=0.2)
+        if unavailable:
+            ax.set_title("Unavailable BDBR\n" + "\n".join(unavailable), fontsize=7)
+    fig.suptitle("Multi-factor ablations; separate variant cohorts, not recurrence-only comparisons\n" + codec_caption(bundle), fontsize=10)
+    _save(fig, output_dir, "fig_ablation_bdbr", plt)
 
-    b1 = ax.bar(x - width, tot_ap50, width, label="Total BDBR (GT AP@50)", color=COLOR_OURS)
-    b2 = ax.bar(x, p_ap50, width, label="P-Frame BDBR (GT AP@50)", color=COLOR_SPATIAL, alpha=0.88)
-    b3 = ax.bar(x + width, tot_ap95, width, label="Total BDBR (GT AP@[.5:.95])", color=COLOR_PREONLY)
 
-    ax.axhline(0.0, color="#333333", linewidth=1.0, linestyle="-")
-    for bars in (b1, b2, b3):
-        for bar in bars:
-            h_val = bar.get_height()
-            va = "bottom" if h_val >= 0 else "top"
-            y_off = 0.5 if h_val >= 0 else -0.8
-            ax.text(
-                bar.get_x() + bar.get_width() / 2.0,
-                h_val + y_off,
-                f"{h_val:+.1f}%",
-                ha="center",
-                va=va,
-                fontsize=6.5,
-                weight="bold",
-                color="#222222",
-            )
-    ax.set_xticks(x)
-    ax.set_xticklabels(var_labels, fontsize=8.3)
-    ax.set_ylim(-32.0, 5.0)
-    ax.set_title("(d) 5-Variant Ablation BDBR (%) on Held-Out MOT17-11 & 13 (Real libx265)")
-    ax.set_ylabel("Real libx265 BDBR (%) $\\leftarrow$ Lower is Better")
-    ax.legend(loc="lower left", ncol=1, fontsize=7.4)
-
-    png_path = VIS_DIR / "fig_bdbr_curves.png"
-    pdf_path = VIS_DIR / "fig_bdbr_curves.pdf"
-    fig.savefig(png_path, dpi=300)
-    fig.savefig(pdf_path)
-    shutil.copyfile(png_path, DOCS_FIG_DIR / "fig_bdbr_curves.png")
-    shutil.copyfile(pdf_path, DOCS_FIG_DIR / "fig_bdbr_curves.pdf")
-    print(f"Saved full-scale disjoint real-x265 BD-Rate curves -> {png_path} and {pdf_path}")
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--benchmark", type=Path, required=True, help="Schema-v2 final-ready merged JSON")
+    parser.add_argument("--output-dir", type=Path, help="Explicit local destination; no manuscript copying")
+    parser.add_argument("--validate-only", action="store_true", help="Check input without rendering or writing")
+    args = parser.parse_args(argv)
+    try:
+        bundle = load_benchmark(args.benchmark)
+        if args.validate_only:
+            print(f"Validated final-ready benchmark: {args.benchmark}; CRFs={bundle['crfs']}")
+            return
+        if args.output_dir is None:
+            parser.error("--output-dir is required unless --validate-only")
+        render_figures(bundle, args.output_dir)
+        print(f"Saved local curves and ablation plots to {args.output_dir}")
+    except PlotInputError as exc:
+        parser.error(str(exc))
 
 
 if __name__ == "__main__":

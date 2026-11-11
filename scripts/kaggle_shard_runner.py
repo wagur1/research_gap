@@ -25,6 +25,7 @@ from video_codecs.hybrid_x265_ste import HybridX265STE
 from losses.vcm_temporal_loss import VCMTemporalPreEditLoss
 from vcm_datasets.vcm_video_datasets import RealVCMVideoDataset
 from scripts.prepare_kaggle_datasets import find_mounted_kaggle_dataset
+from scripts.experiment_protocol import CODEC_CONFIGURATION, CRFS, METRIC_POLICY, EXPECTED_TEST_FRAME_IDS, EXCLUDED_TEST_TAIL_FRAME_IDS, sha256_file, validate_soup_provenance
 
 
 def get_shard_slice(items: List[Any], shard_id: int, num_shards: int) -> List[Any]:
@@ -345,6 +346,20 @@ def run_train_shard(args: argparse.Namespace) -> None:
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    training_configuration = {
+        "initialization_seed": 2026, "preset": preset_cfg, "codec": CODEC_CONFIGURATION,
+        "epochs": args.epochs, "patience": args.patience, "min_epochs": args.min_epochs,
+        "lr": args.lr, "batch_size": args.batch_size, "img_size": args.img_size,
+        "clip_len": args.clip_len, "val_every": args.val_every, "val_subsample": args.val_subsample,
+        "data_shard_id": args.data_shard_id, "data_num_shards": args.data_num_shards,
+        "pretrained_detector_requested": args.use_pretrained_fpn,
+        "real_detector_loaded": fpn_teacher.use_torchvision,
+        "validation_severities": list(VAL_SEVERITIES),
+    }
+    try:
+        training_configuration["git_revision"] = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT_DIR, text=True).strip()
+    except (OSError, subprocess.SubprocessError):
+        training_configuration["git_revision"] = None
 
     history = []
     for epoch in range(1, args.epochs + 1):
@@ -433,6 +448,9 @@ def run_train_shard(args: argparse.Namespace) -> None:
                         "stopped_early": False,
                         "epochs_run": len(history),
                         "partial": True,
+                        "training_configuration": training_configuration,
+                        "train_sequences": ["MOT17-02", "MOT17-04", "MOT17-05", "MOT17-10"],
+                        "val_sequences": ["MOT17-09"],
                     },
                     out_dir / f"tscope_{args.variant}_shard{args.shard_id:02d}of{args.num_shards:02d}.pt",
                 )
@@ -456,6 +474,7 @@ def run_train_shard(args: argparse.Namespace) -> None:
             "best_val_loss": best_val if best_state is not None else None,
             "stopped_early": stopped_early,
             "epochs_run": len(history),
+            "training_configuration": training_configuration,
             "train_sequences": ["MOT17-02", "MOT17-04", "MOT17-05", "MOT17-10"],
             "val_sequences": ["MOT17-09"],
         },
@@ -464,6 +483,7 @@ def run_train_shard(args: argparse.Namespace) -> None:
     print(f"Saved shard checkpoint ({ckpt_path.stat().st_size / 1e6:.2f} MB) -> {ckpt_path}")
 
 
+@torch.no_grad()
 @torch.no_grad()
 def run_poc_wishlist2_and_eval_shard(args: argparse.Namespace) -> None:
     """
@@ -478,6 +498,11 @@ def run_poc_wishlist2_and_eval_shard(args: argparse.Namespace) -> None:
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dataset = build_sharded_dataset(args, is_train=False, default_virtual_mult=5)
+    if not isinstance(dataset, RealVCMVideoDataset) or not args.use_pretrained_fpn or not getattr(args, "disjoint_split", True):
+        raise RuntimeError("Final evaluation requires real held-out MOT17 data, disjoint splits, and pretrained Faster R-CNN")
+    expected_frame_ids = dataset.physical_frame_manifest()
+    if expected_frame_ids != EXPECTED_TEST_FRAME_IDS or args.clip_len != 4 or args.img_size != 256:
+        raise RuntimeError("Final evaluation requires all 1,648 complete-clip MOT17 test frames at the preserved 256px/4-frame protocol")
 
     is_real_mot = isinstance(dataset, RealVCMVideoDataset)
     ds_tag = "MOT17_real" if is_real_mot else "synthetic"
@@ -491,13 +516,13 @@ def run_poc_wishlist2_and_eval_shard(args: argparse.Namespace) -> None:
         max_delta_qp=preset_cfg["max_delta_qp"],
     ).to(device)
     if args.ckpt and Path(args.ckpt).exists():
-        ckpt = torch.load(args.ckpt, map_location=device)
-        model.load_state_dict(ckpt["state_dict"], strict=False)
+        ckpt = torch.load(args.ckpt, map_location=device, weights_only=True)
+        validate_soup_provenance(ckpt, args.variant, require_validation=True)
+        model.load_state_dict(ckpt["state_dict"], strict=True)
         print(f"[Eval Shard {args.shard_id}] Loaded trained checkpoint: {args.ckpt}")
-    elif not getattr(args, "allow_untrained", False):
+    else:
         raise FileNotFoundError(
-            f"[R15 Gate] Trained checkpoint required for eval_poc but not found: '{args.ckpt}'. "
-            "Pass --allow_untrained only for smoke testing."
+            f"[R15 Gate] Validated soup checkpoint required for eval_poc but not found: '{args.ckpt}'."
         )
     model.eval()
 
@@ -505,30 +530,29 @@ def run_poc_wishlist2_and_eval_shard(args: argparse.Namespace) -> None:
     spatial_model = TemporalSCOPE(
         base_ch=48, num_families=4, cond_dim=64, qg_size=16, max_delta_qp=0.0
     ).to(device)
-    spatial_ckpt_candidates = []
-    if args.ckpt:
-        ckpt_p = Path(args.ckpt)
-        spatial_ckpt_candidates.extend(
-            [
-                ckpt_p.parent / "tscope_soup_spatial_only_scope.pt",
-                ckpt_p.parent / "spatial_scope_autonomous_disjoint.pt",
-            ]
-        )
-        spatial_ckpt_candidates.extend(sorted(ckpt_p.parent.glob("tscope_spatial_only_scope_shard*.pt")))
-    loaded_spatial = False
-    for sck in spatial_ckpt_candidates:
-        if sck.exists():
-            s_state = torch.load(sck, map_location=device)
-            spatial_model.load_state_dict(s_state.get("state_dict", s_state), strict=False)
-            loaded_spatial = True
-            break
-    if not loaded_spatial and args.ckpt and Path(args.ckpt).exists():
-        spatial_model.load_state_dict(model.state_dict(), strict=False)
+    spatial_ckpt = Path(args.ckpt).parent / "tscope_soup_spatial_only_scope.pt"
+    if not spatial_ckpt.is_file():
+        raise FileNotFoundError("Final evaluation requires the dedicated spatial variant soup")
+    s_state = torch.load(spatial_ckpt, map_location=device, weights_only=True)
+    validate_soup_provenance(s_state, "spatial_only_scope", require_validation=True)
+    spatial_model.load_state_dict(s_state["state_dict"], strict=True)
     spatial_model.eval()
 
     codec = HybridX265STE(use_real_x265_in_forward=True).to(device)
     fpn_teacher = FrozenFPNDetectorTeacher(pretrained=args.use_pretrained_fpn).to(device)
-    qps = [27, 32, 37, 42, 47]
+    if not fpn_teacher.use_torchvision or fpn_teacher.detector is None:
+        raise RuntimeError("Final AP requires actual pretrained Faster R-CNN weights; detector fallback is forbidden")
+    qps = CRFS
+    metadata = {
+        "shard_id": args.shard_id, "num_shards": args.num_shards, "variant": args.variant,
+        "checkpoint_sha256": sha256_file(args.ckpt), "spatial_checkpoint_sha256": sha256_file(spatial_ckpt),
+        "crfs": CRFS, "dataset": "MOT17", "split": "test", "expected_frame_ids": expected_frame_ids,
+        "excluded_tail_frame_ids": EXCLUDED_TEST_TAIL_FRAME_IDS,
+        "detector": {"name": "fasterrcnn_resnet50_fpn_v2", "pretrained": True, "weights": "FasterRCNN_ResNet50_FPN_V2_Weights.DEFAULT"},
+        "codec": CODEC_CONFIGURATION, "metric_policy": METRIC_POLICY,
+        "preprocessing": {"resize": "bilinear_square", "img_size": args.img_size, "clip_len": args.clip_len, "stride": args.clip_len, "tail_policy": "complete_nonoverlapping_clips_only"},
+        "soup_validation": ckpt["validation"],
+    }
 
     shard_records = []
     for idx in range(len(dataset)):
@@ -621,7 +645,8 @@ def run_poc_wishlist2_and_eval_shard(args: argparse.Namespace) -> None:
 
                 # Task-region fidelity & Official GT-box AP inside M_det
                 acc_metrics = fpn_teacher.evaluate_task_accuracy(
-                    video, recon, m_det, gt_boxes=gt_boxes, ignore_boxes=ignore_boxes
+                    video, recon, m_det, gt_boxes=gt_boxes, ignore_boxes=ignore_boxes,
+                    require_real_detector=True, return_raw_detections=True,
                 )
 
                 shard_records.append(
@@ -631,6 +656,13 @@ def run_poc_wishlist2_and_eval_shard(args: argparse.Namespace) -> None:
                         "dataset": ds_tag,
                         "clip_id": clip_id,
                         "qp": qp,
+                        "crf": qp,
+                        "frame_ids": sample["frame_ids"],
+                        "packet_sizes": c_out["packet_sizes"],
+                        "frame_types": c_out["frame_types"],
+                        "height": h,
+                        "width": w,
+                        "raw_detections": {key: [value.tolist() for value in acc_metrics["raw_detections"][key]] for key in ("gt_boxes", "ignore_boxes", "pred_boxes", "pred_scores")},
                         "method": method_name,
                         "total_bpp": round(total_bpp, 5),
                         "i_frame_bpp": round(i_frame_bpp, 5),
@@ -648,8 +680,12 @@ def run_poc_wishlist2_and_eval_shard(args: argparse.Namespace) -> None:
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     json_path = out_dir / f"eval_shard_{args.shard_id:02d}of{args.num_shards:02d}_{args.variant}.json"
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(shard_records, f, indent=2)
+    for record in shard_records:
+        for key, value in record.items():
+            if isinstance(value, float) and not np.isfinite(value):
+                record[key] = None
+    with open(json_path, "x", encoding="utf-8") as f:
+        json.dump({"schema_version": 2, "metadata": metadata, "records": shard_records}, f, indent=2, allow_nan=False)
     print(f"[Eval Shard {args.shard_id}/{args.num_shards}] Wrote {len(shard_records)} records -> {json_path}")
 
 

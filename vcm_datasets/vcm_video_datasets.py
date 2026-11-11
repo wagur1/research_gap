@@ -298,6 +298,19 @@ class RealVCMVideoDataset(Dataset):
 
         return clips
 
+    def physical_frame_manifest(self):
+        frames = []
+        for meta in self._discover_clips():
+            if meta["type"] != "mot_frames":
+                raise ValueError("Final MOT17 evaluation does not accept non-MOT image sequences")
+            sequence = meta["seq_name"].split("-FRCNN")[0]
+            if sequence not in ("MOT17-11", "MOT17-13"):
+                raise ValueError("Final frame manifest contains a non-held-out sequence")
+            frames.extend(f"{sequence}/{int(re.sub(r'\D', '', path.stem) or '1'):06d}" for path in meta["frame_paths"])
+        if len(frames) != len(set(frames)):
+            raise ValueError("Final frame manifest contains overlapping or duplicate frames")
+        return frames
+
     def __len__(self) -> int:
         return len(self.clips)
 
@@ -453,4 +466,5 @@ class RealVCMVideoDataset(Dataset):
             "ignore_boxes": ignore_boxes,
             "clip_id": torch.tensor(idx, dtype=torch.long),
             "seq_name": meta["seq_name"],
+            "frame_ids": [f"{meta['seq_name'].split('-FRCNN')[0]}/{int(re.sub(r'\D', '', path.stem) or '1'):06d}" for path in meta["frame_paths"]] if meta["type"] == "mot_frames" else [f"{meta['seq_name']}/{meta['start_frame'] + offset:06d}" for offset in range(self.clip_len)],
         }

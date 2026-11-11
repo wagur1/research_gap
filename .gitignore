@@ -4,9 +4,14 @@ __pycache__/
 .venv/
 venv/
 outputs/
+outputs_kaggle_pool/
+outputs_kaggle_pool_full/
+outputs_kaggle_pool_poc/
+outputs_kaggle_disjoint/*.log
 data/
 *pool*.json
 *.pt
+!release_ckpts/*.pt
 *.pth
 *.hevc
 *.rgb

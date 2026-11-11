@@ -104,16 +104,33 @@ class FrozenFPNDetectorTeacher(nn.Module):
         iou_thresh: float = 0.50,
     ) -> float:
         """
-        Official Dataset-Level COCO / Pascal VOC Average Precision (AP) at `iou_thresh` (R03 & R04 fix):
+        COCO-style dataset-level pedestrian Average Precision (AP) at `iou_thresh` (R03 & R04 fix):
           - Pools predictions across ALL evaluated images/frames simultaneously (including empty-GT images,
             so false positives on empty images penalize precision).
           - Sorts all predictions globally by descending confidence score.
           - Within each image, matches a prediction to the highest-IoU UNMATCHED active GT box (`iou >= iou_thresh`).
           - If a prediction does not match an active GT box, checks whether it overlaps an ignore/distractor
-            region (`iou >= iou_thresh`); if so, marks it ignored (neither TP nor FP, matching MOT17/COCO protocol).
+            region (`iou >= iou_thresh`); if so, marks it ignored (neither TP nor FP).
+            This explicit reusable-IoU ignore policy is not full official COCO crowd/area/maxDets evaluation.
           - Integrates the precision-recall envelope over the exact 101-point COCO recall grid `[0.00, 0.01, ..., 1.00]`.
         """
         from torchvision.ops import box_iou
+
+        count = len(all_gt_boxes)
+        if len(all_pred_boxes) != count or len(all_pred_scores) != count or (all_ignore_boxes is not None and len(all_ignore_boxes) != count):
+            raise ValueError("AP requires aligned GT, prediction, score, and ignore frame lists")
+        if not math.isfinite(iou_thresh) or not 0.0 < iou_thresh <= 1.0:
+            raise ValueError("Invalid AP IoU threshold")
+        for index in range(count):
+            boxes = [all_gt_boxes[index], all_pred_boxes[index]]
+            if all_ignore_boxes is not None:
+                boxes.append(all_ignore_boxes[index])
+            for tensor in boxes:
+                if tensor.ndim != 2 or tensor.shape[1] != 4 or not bool(torch.isfinite(tensor).all()) or bool(((tensor[:, 2:] - tensor[:, :2]) <= 0).any()):
+                    raise ValueError("AP box tensors must contain finite nondegenerate XYXY boxes")
+            scores = all_pred_scores[index]
+            if scores.ndim != 1 or scores.numel() != all_pred_boxes[index].shape[0] or not bool(torch.isfinite(scores).all()) or bool(((scores < 0) | (scores > 1)).any()):
+                raise ValueError("AP confidence scores must align with boxes and lie in [0, 1]")
 
         total_gt = sum(int(g.shape[0]) for g in all_gt_boxes)
         if total_gt == 0:
@@ -209,10 +226,10 @@ class FrozenFPNDetectorTeacher(nn.Module):
         all_ignore_boxes: Optional[List[torch.Tensor]] = None,
     ) -> Dict[str, float]:
         """
-        Computes official dataset-level `gt_ap50_pct` (IoU=0.50) and `gt_ap50_95_pct`
+        Computes COCO-style dataset-level `gt_ap50_pct` (IoU=0.50) and `gt_ap50_95_pct`
         (mean over IoU=0.50:0.05:0.95) across all evaluated frames.
         """
-        iou_thresholds = [0.50 + 0.05 * i for i in range(10)]
+        iou_thresholds = [round(0.50 + 0.05 * i, 2) for i in range(10)]
         aps = [
             FrozenFPNDetectorTeacher.compute_dataset_level_ap(
                 all_gt_boxes,

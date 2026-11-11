@@ -251,6 +251,7 @@ class HybridX265STE(nn.Module):
         clip: torch.Tensor,
         qp: int,
         ctu_qp_offsets: Optional[torch.Tensor] = None,
+        return_packet_sizes: bool = False,
     ) -> Tuple[torch.Tensor, float, torch.Tensor, List[str]]:
         """
         Encodes a single clip [T, 3, H, W] in [0, 1] using REAL `libx265` via ffmpeg,
@@ -316,14 +317,30 @@ class HybridX265STE(nn.Module):
                 "error",
                 "-select_streams",
                 "v:0",
+                "-show_packets",
+                "-show_frames",
                 "-show_entries",
-                "frame=pict_type,pkt_size",
+                "packet=pos,size:frame=pict_type,pkt_size,pkt_pos",
                 "-of",
                 "json",
                 str(bitstream),
             ]
             probe_res = subprocess.run(cmd_probe, capture_output=True, text=True, check=True)
-            probe_frames = json.loads(probe_res.stdout).get("frames", [])
+            probe_data = json.loads(probe_res.stdout)
+            combined = probe_data.get("packets_and_frames", [])
+            probe_frames = probe_data.get("frames", [row for row in combined if row.get("type") == "frame"])
+            packets = probe_data.get("packets", [row for row in combined if row.get("type") == "packet"])
+            packet_by_pos = {}
+            for packet in packets:
+                position = str(packet.get("pos", ""))
+                size = int(packet.get("size", 0))
+                if not position or position in packet_by_pos or size <= 0:
+                    raise RuntimeError("ffprobe returned invalid or duplicate video packets")
+                packet_by_pos[position] = size
+            if len(packet_by_pos) != t:
+                raise RuntimeError(f"ffprobe returned {len(packet_by_pos)} video packets, expected {t}")
+            packet_sizes = []
+            matched_positions = set()
             if len(probe_frames) != t:
                 raise RuntimeError(
                     f"ffprobe returned {len(probe_frames)} frames, expected {t}"
@@ -334,7 +351,14 @@ class HybridX265STE(nn.Module):
             for pf_idx, pf in enumerate(probe_frames):
                 if "pkt_size" not in pf or "pict_type" not in pf:
                     raise RuntimeError(f"ffprobe frame {pf_idx} missing pkt_size or pict_type: {pf}")
-                pkt_bytes = int(pf["pkt_size"])
+                position = str(pf.get("pkt_pos", ""))
+                if position in matched_positions or position not in packet_by_pos:
+                    raise RuntimeError("ffprobe frame has no unique corresponding video packet")
+                matched_positions.add(position)
+                pkt_bytes = packet_by_pos[position]
+                if pkt_bytes != int(pf["pkt_size"]):
+                    raise RuntimeError("ffprobe packet size differs from matched frame pkt_size")
+                packet_sizes.append(pkt_bytes)
                 pict_t = str(pf["pict_type"]).strip()
                 if pkt_bytes <= 0:
                     raise RuntimeError(f"ffprobe frame {pf_idx} returned non-positive pkt_size={pkt_bytes}")
@@ -367,6 +391,8 @@ class HybridX265STE(nn.Module):
                 torch.from_numpy(dec_np).to(device=clip.device, dtype=clip.dtype) / 255.0
             )
             recon_clip = recon_clip.permute(0, 3, 1, 2).contiguous()
+            if return_packet_sizes:
+                return recon_clip, total_bpp, frame_bpps, frame_types, packet_sizes
             return recon_clip, total_bpp, frame_bpps, frame_types
 
     def _build_addroi_filter_from_mask_or_offsets(
@@ -390,15 +416,17 @@ class HybridX265STE(nn.Module):
         recons = []
         frame_rate_rows = []
         all_types: List[List[str]] = []
+        all_packet_sizes: List[List[int]] = []
 
         for idx in range(b):
             off_i = ctu_qp_offsets[idx] if ctu_qp_offsets is not None else None
-            recon_i, _, f_bpps_i, f_types_i = self.encode_decode_x265_clip(
-                video_edit[idx].detach(), qp, off_i
+            recon_i, _, f_bpps_i, f_types_i, sizes_i = self.encode_decode_x265_clip(
+                video_edit[idx].detach(), qp, off_i, return_packet_sizes=True
             )
             recons.append(recon_i)
             frame_rate_rows.append(f_bpps_i)
             all_types.append(f_types_i)
+            all_packet_sizes.append(sizes_i)
 
         video_recon = torch.stack(recons, dim=0)
         rate_per_frame = torch.stack(frame_rate_rows, dim=0)  # [B, T]
@@ -418,6 +446,10 @@ class HybridX265STE(nn.Module):
             "i_frame_bpp": float(np.mean(i_rates)) if i_rates else float("nan"),
             "p_frame_bpp": float(np.mean(p_rates)) if p_rates else float("nan"),
             "frame_types": all_types[0] if all_types else [],
+            "packet_sizes": all_packet_sizes[0] if b == 1 else all_packet_sizes,
+            "height": video_edit.shape[-2],
+            "width": video_edit.shape[-1],
+            "bitrate_accounting": "mp4_video_packet_payload_excluding_container_and_global_headers",
             "rate_control_mode": f"crf={qp}:aq-mode=2:bframes=0:keyint={video_edit.shape[1]}",
         }
 

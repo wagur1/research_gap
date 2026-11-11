@@ -1,4 +1,6 @@
 import argparse
+import datetime
+import time
 import json
 import os
 import shutil
@@ -16,6 +18,8 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from scripts.merge_shards import merge_checkpoints_soup, merge_eval_jsons_and_print_table
+from scripts.experiment_protocol import sha256_file, VARIANTS, validate_soup_provenance
+from scripts.kaggle_output_download import download_kernel_outputs
 
 
 # 5 Ablation variants mapped cyclically or explicitly across the 21 accounts
@@ -62,6 +66,7 @@ def build_worker_script(
     patience: int = 0,
     min_epochs: int = 10,
     lr: float = 1e-4,
+    git_revision: str = "",
 ) -> str:
     """
     Generates the standalone Python script pushed to each Kaggle account's kernel.
@@ -87,6 +92,7 @@ DATA_NUM_SHARDS = {data_num_shards}
 PATIENCE = {patience}
 MIN_EPOCHS = {min_epochs}
 LR = {lr}
+GIT_REVISION = {git_revision!r}
 
 repo_dir = Path("/tmp/research_gap")
 if repo_dir.exists():
@@ -95,6 +101,11 @@ subprocess.run(
     ["git", "clone", "https://github.com/wagur1/research_gap.git", str(repo_dir)],
     check=True,
 )
+if GIT_REVISION:
+    subprocess.run(["git", "checkout", "--detach", GIT_REVISION], cwd=str(repo_dir), check=True)
+    actual_revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=str(repo_dir), text=True).strip()
+    if actual_revision != GIT_REVISION:
+        raise RuntimeError("Pinned evaluation revision mismatch")
 
 env = os.environ.copy()
 env["PYTHONPATH"] = str(repo_dir) + os.pathsep + env.get("PYTHONPATH", "")
@@ -175,6 +186,24 @@ def verify_pool(accounts: List[Tuple[str, str]]) -> None:
 
 
 def push_all_shards(args: argparse.Namespace, accounts: List[Tuple[str, str]]) -> None:
+    if args.run_mode == "eval_soup":
+        import torch
+        revision = args.git_revision
+        if len(revision) != 40 or any(value not in "0123456789abcdef" for value in revision):
+            raise ValueError("eval_soup requires --git_revision with a full published commit hash")
+        head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT_DIR, text=True).strip()
+        if revision != head:
+            raise ValueError("Pinned evaluation revision must match local reviewed HEAD")
+        if subprocess.check_output(["git", "diff", "--name-only", "HEAD"], cwd=ROOT_DIR, text=True).strip():
+            raise ValueError("Commit and review local changes before evaluation dispatch")
+        for variant in VARIANTS:
+            path = ROOT_DIR / "release_ckpts" / f"tscope_soup_{variant}.pt"
+            soup = torch.load(path, map_location="cpu", weights_only=True)
+            validate_soup_provenance(soup, variant, require_validation=True)
+            published = subprocess.check_output(["git", "show", f"{revision}:release_ckpts/{path.name}"], cwd=ROOT_DIR)
+            import hashlib
+            if hashlib.sha256(published).hexdigest() != sha256_file(path):
+                raise ValueError("Local checkpoint differs from pinned published revision")
     num_shards = len(accounts)
     max_Idx = min(num_shards, args.max_shards) if args.max_shards > 0 else num_shards
     print(
@@ -214,6 +243,7 @@ def push_all_shards(args: argparse.Namespace, accounts: List[Tuple[str, str]]) -
                     patience=args.patience,
                     min_epochs=args.min_epochs,
                     lr=args.lr,
+                    git_revision=args.git_revision,
                 )
                 (tmp_path / "worker.py").write_text(worker_code, encoding="utf-8")
 
@@ -274,26 +304,39 @@ def check_status_all(args: argparse.Namespace, accounts: List[Tuple[str, str]]) 
 
 def pull_and_merge_all(args: argparse.Namespace, accounts: List[Tuple[str, str]]) -> None:
     num_shards = len(accounts)
+    if num_shards != 21:
+        raise ValueError("Handover collection requires the existing 21-account pool")
     max_idx = min(num_shards, args.max_shards) if args.max_shards > 0 else num_shards
-    out_dir = Path(args.output_dir)
+    out_dir = Path(args.output_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
-
-    print(f"Pulling outputs from {max_idx} Kaggle accounts into {out_dir}...")
-    pulled = 0
+    collection = Path(tempfile.mkdtemp(prefix="collection_", dir=out_dir))
+    manifest = {"schema_version": 2, "expected_shards": num_shards, "collected_at_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(), "shards": []}
+    print(f"Collecting completed outputs into isolated directories under {collection}...")
     for shard_id in range(max_idx):
         user, token = accounts[shard_id]
         kernel_id = f"{user}/t-scope-vcm-shard-{shard_id:02d}"
+        entry = {"shard_id": shard_id, "kernel_id": kernel_id, "expected_variant": ABLATION_ROTATION[shard_id % 5], "downloaded": False}
         try:
             api = get_authenticated_api(user, token)
-            api.kernels_output(kernel_id, path=str(out_dir), quiet=True)
-            print(f"  [Shard {shard_id:02d}] Downloaded outputs from {kernel_id}")
-            pulled += 1
-        except Exception as e:
-            print(f"  [Shard {shard_id:02d}] Skip {kernel_id} ({e})")
-
-    print(f"\nPulled {pulled}/{max_idx} shards. Running aggregation & Model Soup merge...")
-    merge_eval_jsons_and_print_table(str(out_dir))
-    merge_checkpoints_soup(str(out_dir), str(out_dir / "tscope_merged_soup.pt"))
+            status = api.kernels_status(kernel_id)
+            entry["status"] = str(getattr(status, "status", status))
+            if entry["status"].upper().split(".")[-1] != "COMPLETE":
+                print(f"  [Shard {shard_id:02d}] {entry['status']}; skipped")
+            else:
+                destination = Path(tempfile.mkdtemp(prefix=f"shard_{shard_id:02d}_", dir=collection))
+                entry["directory"] = str(destination)
+                download_kernel_outputs(api, kernel_id, destination)
+                entry["files"] = [{"path": str(path.relative_to(destination)), "bytes": path.stat().st_size, "sha256": sha256_file(path)} for path in sorted(destination.rglob("*")) if path.is_file() and not path.is_symlink()]
+                entry["downloaded"] = True
+                print(f"  [Shard {shard_id:02d}] Downloaded {len(entry['files'])} files")
+        except Exception as error:
+            entry["error_type"] = type(error).__name__
+            print(f"  [Shard {shard_id:02d}] Collection failed: {type(error).__name__}; credentials not logged")
+        manifest["shards"].append(entry)
+        (collection / "collection_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        time.sleep(1.5)
+    print(f"Collection manifest -> {collection / 'collection_manifest.json'}")
+    print("No automatic merge performed. Use scripts/merge_shards.py with the checked manifest.")
 
 
 def main() -> None:
@@ -308,7 +351,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--action",
-        choices=["verify_pool", "push", "status", "pull_and_merge"],
+        choices=["verify_pool", "push", "status", "pull", "pull_and_merge"],
         default="verify_pool",
     )
     parser.add_argument(
@@ -341,6 +384,7 @@ def main() -> None:
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--img_size", type=int, default=256)
     parser.add_argument("--max_shards", type=int, default=0, help="0 = use all accounts")
+    parser.add_argument("--git_revision", default="", help="Full reviewed and published commit hash required for eval_soup")
     parser.add_argument("--output_dir", type=str, default="./outputs_kaggle_pool")
     args = parser.parse_args()
 
@@ -351,7 +395,7 @@ def main() -> None:
         push_all_shards(args, accounts)
     elif args.action == "status":
         check_status_all(args, accounts)
-    elif args.action == "pull_and_merge":
+    elif args.action in ("pull", "pull_and_merge"):
         pull_and_merge_all(args, accounts)
 
 

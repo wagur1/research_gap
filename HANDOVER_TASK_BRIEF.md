@@ -1,206 +1,136 @@
-# T-SCOPE HANDOVER TASK BRIEF & EXECUTION PLAYBOOK
-**Target Publication:** IEEE Transactions on Circuits and Systems for Video Technology (TCSVT) / IEEE Transactions on Image Processing (TIP)  
-**Project Title:** T-SCOPE: Temporally-Consistent Semantic Pre-Editing and CTU-Level Rate Allocation for Video Coding for Machines  
-**Document Type:** AI Agent Handover / Next-Shift Operational Blueprint  
-**Last Updated:** November 2026  
-**Status:** In-Progress (Converged Training Phase across 21 Kaggle Shards)
+# T-SCOPE handover: convergence collection and paired evaluation
 
----
+**Target:** IEEE TCSVT / TIP
 
-## 1. Executive Summary & Core Contribution
+**Updated:** 2026-11-12
 
-### 1.1 The Scientific Objective
-Video Coding for Machines (VCM) focuses on compressing video for downstream machine analysis (e.g., object detection, tracking) rather than human visual pleasure. Traditional video codecs (e.g., standard HEVC/libx265) allocate bits to maintain pixel-level fidelity everywhere, wasting bitrate on machine-irrelevant background.
+**Status:** All 21 training shards and all 5 variant Model Soups are collected and validated on complete MOT17-09. Ready for publication and paired `eval_soup` dispatch upon approval.
+**Decision:** Preserve the running experiment. Do not silently substitute the original brief's proposed 64×64 CTU / ±12 settings.
 
-**T-SCOPE** resolves this via a dual-mechanism framework:
-1. **Temporally-Consistent Semantic Pre-Editing (IWA-Net):** An Instance-Weighted Attention network estimates a dynamic attention mask $A_t \in [0, 1]^{H \times W}$ and a residual pre-edit $\Delta_{\text{obj}}$. High-relevance foreground regions are enhanced for feature extraction; background is smoothed to eliminate high-frequency bits.
-2. **CTU-Level Rate Allocation ($\Delta\text{QP}_t$ Injection):** Computes a per-CTU (64x64) quantization parameter delta map $\Delta\text{QP}_t \in [-12, +12]$. Negative $\Delta\text{QP}$ (higher quality/lower quantization) is allocated to machine-salient CTUs, while positive $\Delta\text{QP}$ compresses background heavily. This is injected into actual `libx265` via per-frame dynamic filtergraphs using `quantOffsets`.
+## 1. Verified state and remaining gates
 
-### 1.2 Downstream Machine Task
-- **Detector:** Pretrained Faster R-CNN with ResNet-50-FPN (`torchvision.models.detection.fasterrcnn_resnet50_fpn`).
-- **Benchmark:** MOT17 pedestrian dataset (`mark == 1 and class_id == 1`). Ignore/distractor classes (`2, 7, 8, 12` or `mark == 0`) are filtered correctly according to MOT17 protocol.
-- **Metric:** **Dataset-Level 101-Point COCO AP** (`AP@50`, `AP@50:95`) evaluated across all decoded frames, paired with Bjontegaard Delta Rate (**BD-Rate** / BDBR) against unedited HEVC baseline.
+The 2026-11-12 consolidated collection verified **all 21 completed shards (21/21)** and **all 5 validated Model Soups (5/5)**:
 
----
+| Variant | Validated constituents | Expected constituents | Validated Soup MOT17-09 Loss | Constituent best losses |
+|---|---|---|---|---|
+| `full_tscope` | 00, 05, 10, 15, 20 | 00, 05, 10, 15, 20 | `12.742629` | `[11.8433, 11.7516, 12.3358, 12.0157, 13.0095]` |
+| `spatial_only_scope` | 01, 06, 11, 16 | 01, 06, 11, 16 | `12.415585` | `[12.9107, 13.2524, 12.6541, 12.5981]` |
+| `wo_ctu_delta_qp` | 02, 07, 12, 17 | 02, 07, 12, 17 | `12.300856` | `[13.1044, 12.3472, 12.0754, 11.5572]` |
+| `iwa_gop_qp_reuse` | 03, 08, 13, 18 | 03, 08, 13, 18 | `12.594893` | `[12.3554, 12.2894, 12.2246, 11.7911]` |
+| `proxy_only_zhao` | 04, 09, 14, 19 | 04, 09, 14, 19 | `12.445146` | `[13.1437, 12.2289, 11.8806, 12.3579]` |
 
-## 2. Infrastructure & Workspace Map
+All twenty-one collected checkpoints passed source hashes, finite tensor checks, exact parameter keys/shapes/dtypes, strict model loading, split metadata, and early-stop history/log checks. Validation occurs every two epochs; missing `val_loss` on intervening epochs is not nonfinite validation.
 
-| Resource | Path / Identifier | Description |
-| :--- | :--- | :--- |
-| **Local Project Dir** | `C:\Users\Wagur1\Desktop\Paper\vcm_preedit_x265` | Main git repository root |
-| **Remote Git Repo** | `https://github.com/wagur1/research_gap.git` | Branch: `main` |
-| **Kaggle Account Pool** | `C:\Users\Wagur1\Downloads\pool (2).json` | 21 authenticated Kaggle accounts (`username: token`) |
-| **Latest Git Commit** | `f6b288f` | Incremental best-val checkpointing & `typing.Any` fix |
-| **Python Environment** | Python 3.11+ / PyTorch 2.x + CUDA | Standard scientific stack + `ffmpeg`/`ffprobe` |
+- Consolidated 21-shard collection: `C:\Users\Wagur1\Desktop\Paper\handover_artifacts\collection_complete_majwx85s\collection_manifest.json`.
+- Consolidated 21-shard readiness report: `C:\Users\Wagur1\Desktop\Paper\handover_artifacts\collection_complete_majwx85s\checkpoint_readiness.json`.
+- Prepared 5-variant soups: `C:\Users\Wagur1\Desktop\Paper\handover_artifacts\prepared_all_soups_20261112`.
+- Validated 5-variant soups (`release_ready=true` for all 5): `C:\Users\Wagur1\Desktop\Paper\handover_artifacts\validated_all_soups_20261112` (summary: `all_soups_validation_summary.json`).
+- Original checkpoints omit the full training configuration/revision. Preserve original logs and the pre-repair source snapshot; never invent missing provenance.
+- Complete official validation data is now available under `C:\Users\Wagur1\Desktop\Paper\handover_artifacts\official_validation_ey4s473a\assembled`. All 525 JPEGs, GT, and sequence metadata were verified; the 148 previous Kaggle image downloads match byte-for-byte. GT and `seqinfo.ini` also match the training dataset source; comparison report: `C:\Users\Wagur1\Desktop\Paper\handover_artifacts\validation_source_check_k1jigj5t\source_comparison.json`.
+- Original worker source was retrieved read-only into `C:\Users\Wagur1\Desktop\Paper\handover_artifacts\training_source_z1lo65ry`; its hashes/settings are recorded in `source_manifest.json`. It sets batch size 8 and does not override validation subsampling. Local pre-repair HEAD defaults to every **second** clip; the earlier every-fourth-clip handover claim was incorrect. The remote clone was unpinned, so this evidence does not establish an exact training commit.
+- Current local baseline commit is `b30baa4`; approved repairs are uncommitted. No commits, pushes, checkpoint publication, or Kaggle dispatch have occurred during continuation.
 
----
+## 2. Actual preserved protocol
 
-## 3. Strict Theoretical & Methodological Ground Rules (NON-NEGOTIABLES)
+### Model and encoder
 
-If you modify or evaluate the system, **you must strictly adhere to these rules**:
+`TemporalSCOPE` uses attention-derived **16×16-pixel QG maps**, not a separately learned 64×64 CTU head. The contrast scale is `max_delta_qp=4.0` for full/reuse variants, with subsequent spatial mean subtraction. This is a scale parameter, not proof of a strict ±4 bound after centering.
 
-1. **NO Proxy AP Formulas:**
-   - Never use cosine feature similarity, MSE, SNR, or heuristic scaling to approximate mAP.
-   - All detection AP numbers must be derived by feeding the actual decoded H.265 bitstream into Faster R-CNN and computing true 101-point COCO AP against ground-truth annotations.
-2. **Real `libx265` Encoding & Bitrate Measurement:**
-   - Videos must be encoded using real `ffmpeg -c:v libx265`.
-   - Bitrates must be calculated strictly from packet sizes extracted via `ffprobe -show_packets` (`pkt_size > 0` for `pict_type in ("I", "P", "B")`). Do not calculate bitrate from file size estimates.
-3. **Dynamic CTU Injection Filtergraph:**
-   - Per-frame $\Delta\text{QP}_t$ maps must be piped into `libx265` using the dynamic filtergraph construct:
-     `split + select='eq(n,t)' + addroi + interleave`.
-4. **Strict Dataset Splitting:**
-   - **Train:** `MOT17-02`, `MOT17-04`, `MOT17-05`, `MOT17-10`
-   - **Validation:** `MOT17-09` (used for `val_loss` early stopping)
-   - **Held-Out Test:** `MOT17-11`, `MOT17-13`
-   - Zero test ground truth leakage during inference.
-5. **Understanding VCM Metric Behavior:**
-   - In VCM, a negative BDBR on `GT AP@50` (e.g. `-24.84%`) means that for the same downstream accuracy, the model requires **24.84% fewer bits**. This is the primary victory.
-   - BDBR on `ROI-PSNR` will be positive (`+21.32%`), because pixel fidelity was sacrificed to save bitrate for the machine. Do not mistake positive PSNR BDBR for an error; this is standard VCM behavior.
+The encoder resamples each map to at most **8×8 ROI regions**, clips `addroi` qoffset to `[-0.18, +0.06]`, and injects frame-specific ROI side data through `split + select='eq(n,t)' + addroi + interleave`. Identical maps can use the single shared-map fast path. The actual codec is `ffmpeg -c:v libx265`, preset `medium`, CRF rate control, 25 fps, `aq-mode=2`, IPPP (`bframes=0`), and mini-GOP key interval equal to clip length.
 
----
+Final operating points are **CRF `[22,27,32,37]`**, not fixed-QP rate control. Preserve the existing training severity normalization and training presets.
 
-## 4. Current State Snapshot (At Handover)
+### Detector, split, and metric
 
-### 4.1 Kaggle 21-Shard Convergence Status
-21 shards were dispatched with convergence flags:
-`--epochs 60 --patience 10 --min_epochs 12 --lr 2e-4 --batch_size 8 --ablation_sweep`.
+- Actual detector: pretrained `fasterrcnn_resnet50_fpn_v2` with `FasterRCNN_ResNet50_FPN_V2_Weights.DEFAULT`.
+- Train: `MOT17-02,04,05,10`; validation: `MOT17-09`; held-out test: `MOT17-11,13`.
+- Evaluation: 256×256 bilinear square resize, four-frame nonoverlapping clips.
+- Test manifest: **1,648 frames** (11: 1–900; 13: 1–748). The final two frames of MOT17-13 (749–750) are explicitly excluded by the complete-clip protocol.
+- AP comes exclusively from actual decoded frames through the real detector. No feature similarity, PSNR, or heuristic proxy AP is permitted.
+- Pool raw detections across all evaluated frames per variant/method/CRF before computing 101-point AP@50 and AP@50:95. Never average clip AP.
+- Active pedestrian GT and MOT17 distractor filtering remain explicit. The metric uses reusable IoU-based suppression for unmatched predictions overlapping ignore boxes. Describe this as **COCO-style 101-point pedestrian AP with the declared ignore policy**, not unqualified official COCO crowd/area/maxDets equivalence.
+- Bitrate is **MP4 video-packet payload**, checked using `ffprobe -show_packets` and matching frame `pkt_pos`, `pkt_size`, and `pict_type`. Aggregate integer packet bytes over pixel/frame denominators. Container and global-header overhead are not included; never infer bitrate from file size.
 
-- **Completed Shards (Early Stopped / Converged):**
-  - `Shard 04` (`dngbolm`, `proxy_only_zhao`): Converged at Epoch 12 (`val_loss=13.1437`), checkpoint saved.
-  - `Shard 06` (`tranthihongdieu`, `spatial_only_scope`): Completed.
-- **Running Shards:**
-  - 13 Shards running on GPU T4: `01, 02, 03, 05, 07, 08, 09, 10, 11, 12, 13, 14, 16`.
-  - 6 Shards running on CPU: `00, 15, 17, 18, 19, 20`.
+### Ablation caveats
 
-### 4.2 Ablation Variant Mapping Across 21 Shards
-The 21 accounts rotate through 5 ablation variants:
-1. `full_tscope` (IWA-Net + Temporal Mask + CTU $\Delta\text{QP}$)
-2. `spatial_only_scope` (No temporal GRU/consistency)
-3. `wo_ctu_delta_qp` (Pre-editing only, no CTU rate allocation)
-4. `iwa_gop_qp_reuse` (GOP-level QP reuse baseline)
-5. `proxy_only_zhao` (Prior-art proxy baseline Zhao et al.)
+`spatial_only_scope` disables recurrence/temporal losses, QG allocation, and real-codec STE training. It is a **multi-factor spatial baseline**, not a recurrence-only ablation. `proxy_only_zhao` is an **internal proxy-training baseline**; prior-art implementation equivalence has not been established. `iwa_gop_qp_reuse` reuses the first-frame QG map within each mini-GOP. Never merge weights across variants or pool variant-specific test cohorts under one method label.
 
----
+## 3. Safe execution order
 
-## 5. Next-Agent Step-by-Step Playbook
+Run Python that reads downloaded artifacts with `-I`, outside their directories. Store every kernel's files in its own new empty directory. Do not execute downloaded Python or import packages from output directories. Never print account tokens.
 
-Follow these sequential steps to complete the experimental pipeline and paper artifacts:
+### Step 1: Check and collect existing completed kernels
 
-### Step 1: Monitor & Wait for All 21 Shards to Complete
-Check the status of all kernels periodically:
 ```powershell
-Set-Location -Path "C:\Users\Wagur1\Desktop\Paper\vcm_preedit_x265"
-python scripts/kaggle_pool_orchestrator.py --pool_file "C:\Users\Wagur1\Downloads\pool (2).json" --action status
+Set-Location "C:\Users\Wagur1\Desktop\Paper\vcm_preedit_x265"
+python -I scripts/kaggle_pool_orchestrator.py --pool_file "C:\Users\Wagur1\Downloads\pool (2).json" --action status
+python -I scripts/kaggle_pool_orchestrator.py --pool_file "C:\Users\Wagur1\Downloads\pool (2).json" --action pull --output_dir "C:\Users\Wagur1\Desktop\Paper\handover_artifacts"
 ```
 
-To inspect log output of a specific shard (e.g., Shard 02):
-```powershell
-python -c "
-import json, os
-from kaggle.api.kaggle_api_extended import KaggleApi
-with open(r'C:\Users\Wagur1\Downloads\pool (2).json') as f: pool = list(json.load(f).items())
-user, key = pool[2]
-os.environ['KAGGLE_USERNAME'], os.environ['KAGGLE_KEY'] = user, key
-api = KaggleApi(); api.authenticate()
-api.kernels_output(f'{user}/t-scope-vcm-shard-02', path='./tmp_log')
-print(open('./tmp_log/t-scope-vcm-shard-02.log').readlines()[-20:])
-"
-```
-*Wait until all or the vast majority of shards show `KernelWorkerStatus.COMPLETE`.*
+The collector saves UTF-8 logs, checks output paths and HTTP responses, hashes files, and reports its new `collection_manifest.json`. Running kernels are skipped. `pull_and_merge` is a deprecated collection-only alias: it does **not** silently merge partial results.
 
----
+Do not replace running training kernels. Do not create scheduled polling without the user's explicit scheduling request. A `COMPLETE` kernel is not automatically converged: inspect checkpoint final/partial flags, history, validation losses, and source logs.
 
-### Step 2: Pull Converged Checkpoints and Build Model Soups
-When shards finish training, pull all outputs and automatically compute uniform weight averaging (Model Soup) for each variant:
+### Step 2: Prepare same-variant soups from a checked manifest
+
 ```powershell
-Set-Location -Path "C:\Users\Wagur1\Desktop\Paper\vcm_preedit_x265"
-python scripts/kaggle_pool_orchestrator.py --pool_file "C:\Users\Wagur1\Downloads\pool (2).json" --action pull_and_merge --output_dir ./outputs_kaggle_converged
+python -I scripts/merge_shards.py --action soup --manifest "<collection_manifest.json>" --ckpt_dir "<new_prepared_soup_directory>" --merged_ckpt "<new_prepared_soup_directory>\tscope_merged_soup.pt"
 ```
 
-**Verification:**
-Check that the 5 soup checkpoints are generated:
-- `outputs_kaggle_converged/tscope_soup_full_tscope.pt`
-- `outputs_kaggle_converged/tscope_soup_spatial_only_scope.pt`
-- `outputs_kaggle_converged/tscope_soup_wo_ctu_delta_qp.pt`
-- `outputs_kaggle_converged/tscope_soup_iwa_gop_qp_reuse.pt`
-- `outputs_kaggle_converged/tscope_soup_proxy_only_zhao.pt`
+All variants are required by default. `--variants spatial_only_scope` can prepare that complete variant alone; this does not make the overall experiment complete. Missing constituents, partial checkpoints, incompatible tensors, duplicate files, mismatched hashes, or existing output files cause failure. The outputs record constituent provenance and `validation.status=not_evaluated`.
 
-Copy soup checkpoints to `release_ckpts/` and commit:
+If completion requires multiple collection attempts, create a reviewed consolidated collection with one authoritative source per shard before merging. Do not merge stale directory globs.
+
+### Step 3: Validate prepared soups on complete MOT17-09
+
 ```powershell
-New-Item -ItemType Directory -Force -Path "./release_ckpts"
-Copy-Item ./outputs_kaggle_converged/tscope_soup_*.pt ./release_ckpts/
-git add release_ckpts/
-git commit -m "feat(ckpt): add converged model soup checkpoints across 21 shards"
-git push origin main
+python -I scripts/validate_soups.py --data_root "<full_MOT17_train_root>" --soup_dir "<prepared_soup_directory>" --output_dir "<new_validated_soup_directory>"
 ```
 
----
+The validator requires all 131 complete four-frame MOT17-09 clips and uses the supported training validation protocol: every **second** clip (66 clips / 264 measured frames), logical batch size 8 with a final batch of 2, severity 0.3/0.7, original detector features and per-variant codec/loss settings. The mean preserves the 18 equally weighted batch/severity loss scalars rather than silently sample-weighting the tail. Detector features are computed in single-frame chunks on CPU without changing the logical batch loss or the normalized 256px direct-backbone preprocessing. It records data fingerprints, selected frames, execution/source hashes, measured loss, and constituent best losses. It does not use test AP to select weights. The four-frame visualization subset must fail before any release is written.
 
-### Step 3: Dispatch Paired Evaluation Across 21 Shards (`eval_soup`)
-Once model soup weights are committed to GitHub, dispatch the evaluation run across all 21 shards. Each shard will evaluate all 5 variant soups on its disjoint test slice (`MOT17-11` and `MOT17-13`):
+Complete official data collection, source comparison, runtime chunked-feature equivalence tests, and full MOT17-09 validation for all 5 variants (`full_tscope`, `spatial_only_scope`, `wo_ctu_delta_qp`, `iwa_gop_qp_reuse`, `proxy_only_zhao`) are finished (`release_ready=true` across all 5 soups in `validated_all_soups_20261112`).
+
+### Step 4: Publication and paired evaluation — separate approval required
+
+Before publishing, verify the five soups, validation provenance, file sizes, repository changes, and the exact release revision. Ask explicitly before committing/pushing or uploading checkpoints. Approval for local preparation is not approval for publication or remote dispatch.
+
+After publication and separate dispatch approval:
+
 ```powershell
-python scripts/kaggle_pool_orchestrator.py --pool_file "C:\Users\Wagur1\Downloads\pool (2).json" --action push --run_mode eval_soup
-```
-This triggers real `libx265` encoding across QP points `[22, 27, 32, 37]`, `ffprobe` frame packet byte extraction, and 101-point COCO AP evaluation.
-
----
-
-### Step 4: Pull & Aggregate Final Test Evaluation
-Monitor status using `--action status`. When all shards reach `COMPLETE`:
-```powershell
-python scripts/kaggle_pool_orchestrator.py --pool_file "C:\Users\Wagur1\Downloads\pool (2).json" --action pull_and_merge --output_dir ./outputs_kaggle_converged_eval
-```
-This merges all disjoint test slices into:
-`./outputs_kaggle_converged_eval/merged_benchmarks.json` and prints the final BDBR summary table.
-
----
-
-### Step 5: Update Visuals & Paper Figures
-Run the plotting scripts to regenerate publication figures using the new converged evaluation results:
-```powershell
-# 1. Regenerate RD curves and BDBR bar charts
-python scripts/gen_fig_bdbr_curves.py
-
-# 2. Regenerate qualitative ablation visual grid (attention maps, pre-edits, CTU delta QP heatmaps)
-python scripts/generate_ablation_visuals.py
-```
-Check that the figures in `docs/figures/` are refreshed:
-- `docs/figures/fig_bdbr_curves.png`
-- `docs/figures/ablation_preedit_comparison_grid.png`
-
----
-
-### Step 6: Update Documentation & Final Git Push
-1. Open `README.md`, update Section 5 (**Empirical Validation & Benchmark Results**) with the new final converged BDBR table.
-2. Commit and push everything to GitHub:
-```powershell
-git add docs/figures/ README.md
-git commit -m "docs: finalize converged 21-shard BDBR results and publication figures"
-git push origin main
+python -I scripts/kaggle_pool_orchestrator.py --pool_file "C:\Users\Wagur1\Downloads\pool (2).json" --action push --run_mode eval_soup --git_revision "<full_40_character_reviewed_published_commit>"
 ```
 
----
+Every shard evaluates all five soups. The worker pins the commit instead of silently cloning a moving branch. Local preflight and evaluation reject unvalidated/missing soups. Require all 21 shards; do not present a reduced `--max_shards` run as final.
 
-## 6. Key Codebase Index
+### Step 5: Collect and aggregate complete paired evaluation
 
-| File | Purpose |
-| :--- | :--- |
-| [`models/temporal_scope.py`](file:///C:/Users/Wagur1/Desktop/Paper/vcm_preedit_x265/models/temporal_scope.py) | Full T-SCOPE architecture (IWA-Net, Temporal GRU, Mask Head $A_t$, CTU $\Delta\text{QP}$ Head) |
-| [`models/frozen_detector_fpn.py`](file:///C:/Users/Wagur1/Desktop/Paper/vcm_preedit_x265/models/frozen_detector_fpn.py) | Frozen Faster R-CNN with ResNet-50-FPN downstream detector |
-| [`scripts/kaggle_shard_runner.py`](file:///C:/Users/Wagur1/Desktop/Paper/vcm_preedit_x265/scripts/kaggle_shard_runner.py) | Standalone script executed on Kaggle. Implements training with `ReduceLROnPlateau`, EarlyStopping, and test evaluation |
-| [`scripts/kaggle_pool_orchestrator.py`](file:///C:/Users/Wagur1/Desktop/Paper/vcm_preedit_x265/scripts/kaggle_pool_orchestrator.py) | Multi-account orchestrator: manages authentication, pushing kernels, status tracking, downloading, and Model Soup merging |
-| [`vcm_datasets/vcm_video_datasets.py`](file:///C:/Users/Wagur1/Desktop/Paper/vcm_preedit_x265/vcm_datasets/vcm_video_datasets.py) | MOT17 dataset loader with train/val/test split handling, pedestrian filtering, and ignore masks |
-| [`scripts/gen_fig_bdbr_curves.py`](file:///C:/Users/Wagur1/Desktop/Paper/vcm_preedit_x265/scripts/gen_fig_bdbr_curves.py) | Generates IEEE-ready Rate-Distortion curves and BDBR comparative charts |
-| [`scripts/generate_ablation_visuals.py`](file:///C:/Users/Wagur1/Desktop/Paper/vcm_preedit_x265/scripts/generate_ablation_visuals.py) | Generates side-by-side qualitative visual grids comparing ablation variants |
+Collect into new isolated directories using `--action pull`, then:
 
----
+```powershell
+python -I scripts/merge_shards.py --action eval --manifest "<complete_eval_collection_manifest.json>" --eval_dir "<new_final_summary_directory>"
+```
 
-## 7. Edge Cases & Troubleshooting
+Schema-v2 outputs contain raw detections, stable sequence/frame identities, integer packet bytes, codec/detector/metric/preprocessing provenance, and soup hashes. The merger requires **105 shard–variant outputs**, all methods/CRFs, matching frame partitions, identical expected frames, and no duplicate physical frames. It writes `merged_benchmarks.json` only after checks pass. Degenerate or nonoverlapping AP curves produce `null` BDBR with an explicit reason, not fabricated values.
 
-- **Python 3.13 on Kaggle:** Kaggle environments now run Python 3.13. Avoid missing type imports (e.g., `Any` must be imported explicitly from `typing`).
-- **Kaggle 12-Hour Kernel Limit:** If a CPU shard reaches 12 hours, incremental checkpointing has already saved the best checkpoint up to that point. The orchestrator's `pull_and_merge` will pick up the saved `.pt` file.
-- **Kaggle API Rate Limits (HTTP 429):** If Kaggle throws a 429 error during status checks, increase the sleep interval between accounts in `kaggle_pool_orchestrator.py` by 1.5 seconds.
-- **ffmpeg `libx265` dynamic filtergraph:** If ffmpeg fails on a machine, ensure `ffmpeg` with `libx265` is in system PATH and filtergraph syntax quotes match Windows PowerShell vs Linux bash standards.
+### Step 6: Figures and documentation
 
----
-*End of Handover Brief.*
+```powershell
+python -I scripts/gen_fig_bdbr_curves.py --benchmark "<merged_benchmarks.json>" --validate-only
+python -I scripts/gen_fig_bdbr_curves.py --benchmark "<merged_benchmarks.json>" --output-dir "<new_figure_directory>"
+python -I scripts/generate_ablation_visuals.py --help
+```
+
+Qualitative generation requires explicit variant soups, a final-ready benchmark, and a named held-out sequence/frame. Its grid is labelled **pre-edit inspection**, not decoded reconstruction evidence. Missing checkpoints/random weights cannot silently substitute for trained variants. Render final figures and run the visual acceptance gate before copying them into `docs/figures/`. Current manuscript figures remain historical; no replacements have been generated.
+
+Update README result tables only from the verified merged final benchmark. Confirm before the final commit/push.
+
+## 4. Local verification
+
+65 unit/integration tests passed at continuation, including global-vs-clip AP, empty-GT false positives, ignore handling, strict soups, dtype preservation, preserved `val_subsample=2` validation protocol, chunked detector feature equivalence, paired frame rejection, packet-weighted rates, unavailable BDBR, plot contracts, and real dynamic-ROI `libx265` encode/decode with matched video packets. Source compilation and `git diff --check` passed.
+
+```powershell
+python -I -c "import sys,unittest; sys.path.insert(0,r'C:\Users\Wagur1\Desktop\Paper\vcm_preedit_x265'); suite=unittest.defaultTestLoader.discover(r'C:\Users\Wagur1\Desktop\Paper\vcm_preedit_x265\tests'); result=unittest.TextTestRunner().run(suite); sys.exit(not result.wasSuccessful())"
+```
+
+These tests do not substitute for full validation, complete test inference, publication-quality figure rendering, or evidence that ROI side data achieves the intended spatial rate allocation. Current pipeline results must not be advertised as final TCSVT/TIP performance.

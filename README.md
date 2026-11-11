@@ -122,17 +122,17 @@ Không cần mở trình duyệt, chạy trực tiếp trên máy tính cá nhâ
 # 1. Kiểm tra xác thực toàn bộ 21 tài khoản Kaggle
 python scripts/kaggle_pool_orchestrator.py --pool_file "C:\Users\Wagur1\Downloads\pool (2).json" --action verify_pool
 
-# 2. Đẩy đồng loạt 21 Shard lên 21 tài khoản (Tự động gắn dataset MOT17 & bật GPU T4)
-python scripts/kaggle_pool_orchestrator.py --pool_file "C:\Users\Wagur1\Downloads\pool (2).json" --action push --run_mode both --epochs 10 --batch_size 8
-
-# (Tùy chọn) Chia 21 tài khoản chạy song song cả 5 cấu hình Ablation của bài báo:
-python scripts/kaggle_pool_orchestrator.py --pool_file "C:\Users\Wagur1\Downloads\pool (2).json" --action push --run_mode both --ablation_sweep
+# 2. Huấn luyện mới (chỉ sau xác nhận; không thay thế các kernel đang chạy)
+python -I scripts/kaggle_pool_orchestrator.py --pool_file "C:\Users\Wagur1\Downloads\pool (2).json" --action push --run_mode train --epochs 60 --patience 10 --min_epochs 12 --lr 2e-4 --batch_size 8 --ablation_sweep
 
 # 3. Xem trạng thái chạy của cả 21 tài khoản
-python scripts/kaggle_pool_orchestrator.py --pool_file "C:\Users\Wagur1\Downloads\pool (2).json" --action status
+python -I scripts/kaggle_pool_orchestrator.py --pool_file "C:\Users\Wagur1\Downloads\pool (2).json" --action status
 
-# 4. Tải toàn bộ kết quả (.json + .pt) từ 21 tài khoản về máy, in bảng BDBR (%) & gộp Model Soup
-python scripts/kaggle_pool_orchestrator.py --pool_file "C:\Users\Wagur1\Downloads\pool (2).json" --action pull_and_merge --output_dir ./outputs_kaggle_pool
+# 4. Tải các output hoàn tất vào thư mục riêng từng kernel; không tự gộp kết quả thiếu
+python -I scripts/kaggle_pool_orchestrator.py --pool_file "C:\Users\Wagur1\Downloads\pool (2).json" --action pull --output_dir ./outputs_kaggle_pool
+
+# 5. Gộp từ manifest đã kiểm tra; xem HANDOVER_TASK_BRIEF.md cho validation và eval_soup
+python -I scripts/merge_shards.py --action soup --manifest "<collection_manifest.json>" --ckpt_dir "<new_soup_dir>" --merged_ckpt "<new_soup_dir>/tscope_merged_soup.pt"
 ```
 
 ### Cách 2: Chạy thủ công 1-Cell trên Kaggle Notebook (`GPU T4 x2`)
@@ -169,6 +169,12 @@ VARIANT = "full_tscope"  # Hoặc: spatial_only_scope | wo_ctu_delta_qp | iwa_go
 
 
 ## 5. Kết quả Thực nghiệm (`libx265` thật + `ffprobe pkt_size` + GT AP trên tập Held-Out `MOT17-11` & `MOT17-13`)
+
+> **Cập nhật handover 2026-11-12:** Đã thu thập và kiểm tra đủ **21/21 checkpoint hội tụ** (`collection_complete_majwx85s`); gộp và hoàn tất validation đầy đủ trên 525 frame `MOT17-09` cho **cả 5/5 Model Soup** (`validated_all_soups_20261112`, `release_ready=true`: `wo_ctu_delta_qp` `12.3009`, `spatial_only_scope` `12.4156`, `proxy_only_zhao` `12.4451`, `iwa_gop_qp_reuse` `12.5949`, `full_tscope` `12.7426`). Pipeline cục bộ đã sửa AP toàn bộ dataset, tách variant, kiểm tra frame ghép cặp, packet bytes và validation protocol; 65 test pass. Sẵn sàng publish 5 soup và dispatch `eval_soup` trên 21 shard để lấy bảng BDBR cuối cùng ngay khi được duyệt. Xem [playbook cập nhật](./HANDOVER_TASK_BRIEF.md).
+>
+> **Protocol được giữ nguyên:** QG 16×16, scale ΔQP=4 cho full/reuse (có mean-centering), ROI tối đa 8×8 và qoffset clamp `[-0.18,+0.06]`; không phải CTU 64×64/±12. Detector thực là `fasterrcnn_resnet50_fpn_v2`. Đánh giá cuối dùng CRF `[22,27,32,37]`, AP pedestrian 101-point với ignore-IoU policy được công bố, và bitrate payload video-packet MP4 (không gồm container/global headers). Spatial là baseline nhiều thay đổi, không phải ablation chỉ recurrence; `proxy_only_zhao` là baseline proxy-training nội bộ, chưa xác minh tương đương prior art.
+>
+> **Các bảng bên dưới là số liệu lịch sử:** clip AP từng được tính rồi gộp trung bình, không phải AP toàn bộ dataset. Chỉ dùng để mô tả pilot; không trích làm benchmark cuối cùng. Final merger schema-v2 không chấp nhận các JSON cũ để tạo kết quả cuối.
 
 > **Phạm vi và giới hạn (đọc trước khi trích số):**
 > - Nguồn: [`outputs_rigor_gate0_gate1/kaggle_21shards_disjoint_summary.json`](./outputs_rigor_gate0_gate1/kaggle_21shards_disjoint_summary.json), gộp **19/21 shard** hoàn tất lúc thu thập (shard 15 và 18 còn `RUNNING`, chưa có eval). Tổng 374 lượt clip x QP, 9350 bản ghi mã hóa.
