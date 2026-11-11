@@ -420,6 +420,22 @@ def run_train_shard(args: argparse.Namespace) -> None:
             if improved:
                 best_val, best_epoch, epochs_since_best = val_loss, epoch, 0
                 best_state = {k: v.detach().cpu().clone() for k, v in base_model.state_dict().items()}
+                # Incremental best-checkpoint save so a timed-out kernel (e.g. CPU fallback) still returns usable weights
+                torch.save(
+                    {
+                        "shard_id": args.shard_id,
+                        "num_shards": args.num_shards,
+                        "variant": args.variant,
+                        "state_dict": best_state,
+                        "history": history,
+                        "best_epoch": best_epoch,
+                        "best_val_loss": best_val,
+                        "stopped_early": False,
+                        "epochs_run": len(history),
+                        "partial": True,
+                    },
+                    out_dir / f"tscope_{args.variant}_shard{args.shard_id:02d}of{args.num_shards:02d}.pt",
+                )
             else:
                 epochs_since_best += args.val_every
             if epoch >= args.min_epochs and epochs_since_best >= args.patience:
