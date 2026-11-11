@@ -185,8 +185,11 @@ def read_raw_yuv420_frame(
     return torch.from_numpy(rgb.astype(np.float32))
 
 
-# Official Disjoint Train / Held-Out Test Split on MOT17 (Gate 1 / F08 fix)
-MOT17_TRAIN_PREFIXES = ("MOT17-02", "MOT17-04", "MOT17-05", "MOT17-09", "MOT17-10")
+# Disjoint Train / Validation / Held-Out Test Split on MOT17 (Gate 1 / F08 fix).
+# Validation (MOT17-09) is used only for early stopping and LR scheduling; test (11, 13) is never touched
+# until final evaluation, so convergence is decided without test-set leakage.
+MOT17_TRAIN_PREFIXES = ("MOT17-02", "MOT17-04", "MOT17-05", "MOT17-10")
+MOT17_VAL_PREFIXES = ("MOT17-09",)
 MOT17_TEST_PREFIXES = ("MOT17-11", "MOT17-13")
 
 
@@ -213,6 +216,7 @@ class RealVCMVideoDataset(Dataset):
         img_size: int = 512,
         is_train: bool = True,
         enforce_disjoint_split: bool = False,
+        split: Optional[str] = None,
     ) -> None:
         super().__init__()
         self.data_root = Path(data_root) if data_root else None
@@ -221,6 +225,10 @@ class RealVCMVideoDataset(Dataset):
         self.img_size = img_size
         self.is_train = is_train
         self.enforce_disjoint_split = enforce_disjoint_split
+        # `split` in {"train", "val", "test"} selects MOT17 sequences; default follows `is_train`.
+        self.split = split if split is not None else ("train" if is_train else "test")
+        if self.split not in ("train", "val", "test"):
+            raise ValueError(f"split must be train/val/test, got {self.split}")
 
         all_clips = self._discover_clips()
         self.clips = get_shard_slice(all_clips, shard_id, num_shards)
@@ -239,7 +247,11 @@ class RealVCMVideoDataset(Dataset):
             if any(tag in seq_dir.name for tag in ("-SDP", "-DPM")):
                 continue
             if self.enforce_disjoint_split and seq_dir.name.startswith("MOT17-"):
-                allowed = MOT17_TRAIN_PREFIXES if self.is_train else MOT17_TEST_PREFIXES
+                allowed = {
+                    "train": MOT17_TRAIN_PREFIXES,
+                    "val": MOT17_VAL_PREFIXES,
+                    "test": MOT17_TEST_PREFIXES,
+                }[self.split]
                 if not any(seq_dir.name.startswith(p) for p in allowed):
                     continue
             gt_path = seq_dir / "gt" / "gt.txt"

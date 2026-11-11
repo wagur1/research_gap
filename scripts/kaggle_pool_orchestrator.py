@@ -57,11 +57,18 @@ def build_worker_script(
     batch_size: int,
     img_size: int,
     run_mode: str,
+    data_shard_id: int = -1,
+    data_num_shards: int = -1,
+    patience: int = 0,
+    min_epochs: int = 10,
+    lr: float = 1e-4,
 ) -> str:
     """
     Generates the standalone Python script pushed to each Kaggle account's kernel.
     Clones the latest code from https://github.com/wagur1/research_gap.git,
     installs ffmpeg if missing, and writes outputs directly to `/kaggle/working`.
+    Run modes: `train`, `eval_poc` (per-shard ckpt), `both`, and `eval_soup`
+    (evaluates every variant's merged soup from `release_ckpts/` on this shard's test slice).
     """
     return f'''import os
 import subprocess
@@ -75,6 +82,11 @@ EPOCHS = {epochs}
 BATCH_SIZE = {batch_size}
 IMG_SIZE = {img_size}
 RUN_MODE = "{run_mode}"
+DATA_SHARD_ID = {data_shard_id}
+DATA_NUM_SHARDS = {data_num_shards}
+PATIENCE = {patience}
+MIN_EPOCHS = {min_epochs}
+LR = {lr}
 
 repo_dir = Path("/tmp/research_gap")
 if repo_dir.exists():
@@ -96,10 +108,15 @@ if RUN_MODE in ("train", "both"):
         "--mode", "train",
         "--shard_id", str(SHARD_ID),
         "--num_shards", str(NUM_SHARDS),
+        "--data_shard_id", str(DATA_SHARD_ID),
+        "--data_num_shards", str(DATA_NUM_SHARDS),
         "--variant", VARIANT,
         "--epochs", str(EPOCHS),
         "--batch_size", str(BATCH_SIZE),
         "--img_size", str(IMG_SIZE),
+        "--lr", str(LR),
+        "--patience", str(PATIENCE),
+        "--min_epochs", str(MIN_EPOCHS),
         "--enable_x265_ste",
         "--use_pretrained_fpn",
         "--output_dir", "/kaggle/working",
@@ -120,6 +137,23 @@ if RUN_MODE in ("eval_poc", "both"):
         "--output_dir", "/kaggle/working",
     ]
     subprocess.run(cmd_eval, cwd=str(repo_dir), env=env, check=True)
+
+if RUN_MODE == "eval_soup":
+    for soup_variant in ["full_tscope", "spatial_only_scope", "wo_ctu_delta_qp", "iwa_gop_qp_reuse", "proxy_only_zhao"]:
+        soup_ckpt = repo_dir / "release_ckpts" / f"tscope_soup_{{soup_variant}}.pt"
+        cmd_eval = [
+            sys.executable,
+            str(repo_dir / "scripts" / "kaggle_shard_runner.py"),
+            "--mode", "eval_poc",
+            "--shard_id", str(SHARD_ID),
+            "--num_shards", str(NUM_SHARDS),
+            "--variant", soup_variant,
+            "--img_size", str(IMG_SIZE),
+            "--ckpt", str(soup_ckpt),
+            "--use_pretrained_fpn",
+            "--output_dir", "/kaggle/working",
+        ]
+        subprocess.run(cmd_eval, cwd=str(repo_dir), env=env, check=True)
 
 print(f"=== Shard {{SHARD_ID}}/{{NUM_SHARDS}} ({{VARIANT}}) finished successfully! ===")
 '''
@@ -148,13 +182,18 @@ def push_all_shards(args: argparse.Namespace, accounts: List[Tuple[str, str]]) -
         f"(mode={args.run_mode}, dataset={args.dataset_slug})..."
     )
 
+    shard_variants = [
+        ABLATION_ROTATION[s % len(ABLATION_ROTATION)] if args.ablation_sweep else args.variant
+        for s in range(max_Idx)
+    ]
+
     for shard_id in range(max_Idx):
         user, token = accounts[shard_id]
-        variant = (
-            ABLATION_ROTATION[shard_id % len(ABLATION_ROTATION)]
-            if args.ablation_sweep
-            else args.variant
-        )
+        variant = shard_variants[shard_id]
+        # Each variant's shards partition the train data among themselves, so every variant sees the full train split.
+        same_variant_ids = [s for s in range(max_Idx) if shard_variants[s] == variant]
+        data_shard_id = same_variant_ids.index(shard_id)
+        data_num_shards = len(same_variant_ids)
         slug = f"t-scope-vcm-shard-{shard_id:02d}"
         kernel_id = f"{user}/{slug}"
 
@@ -170,6 +209,11 @@ def push_all_shards(args: argparse.Namespace, accounts: List[Tuple[str, str]]) -
                     batch_size=args.batch_size,
                     img_size=args.img_size,
                     run_mode=args.run_mode,
+                    data_shard_id=data_shard_id,
+                    data_num_shards=data_num_shards,
+                    patience=args.patience,
+                    min_epochs=args.min_epochs,
+                    lr=args.lr,
                 )
                 (tmp_path / "worker.py").write_text(worker_code, encoding="utf-8")
 
@@ -269,7 +313,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--run_mode",
-        choices=["eval_poc", "train", "both"],
+        choices=["eval_poc", "train", "both", "eval_soup"],
         default="both",
         help="What each Kaggle kernel executes",
     )
@@ -290,7 +334,10 @@ def main() -> None:
         default="ahmedsamir1598/mot17challenge",
         help="Kaggle dataset slug automatically mounted in each kernel",
     )
-    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--epochs", type=int, default=10, help="Max epochs (upper bound when --patience > 0)")
+    parser.add_argument("--patience", type=int, default=0, help="Early-stop patience on MOT17-09 val loss; 0 = fixed epochs")
+    parser.add_argument("--min_epochs", type=int, default=10)
+    parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--img_size", type=int, default=256)
     parser.add_argument("--max_shards", type=int, default=0, help="0 = use all accounts")

@@ -178,12 +178,17 @@ ABLATION_PRESETS: Dict[str, Dict[str, Any]] = {
 
 
 def build_sharded_dataset(
-    args: argparse.Namespace, is_train: bool = True, default_virtual_mult: int = 20
+    args: argparse.Namespace,
+    is_train: bool = True,
+    default_virtual_mult: int = 20,
+    split: str = None,
+    shard_id: int = None,
+    num_shards: int = None,
 ) -> Dataset:
     """
     Auto-selects `RealVCMVideoDataset` (MOT17 / SFU-HW-Objects-v1 / BDD100K) if
     `--data_root` is provided or auto-detected in `/kaggle/input`; otherwise falls
-    back to `ShardedVideoClipDataset`.
+    back to `ShardedVideoClipDataset`. `split` in {train, val, test} picks MOT17 sequences.
     """
     data_root = args.data_root
     if not data_root:
@@ -193,24 +198,27 @@ def build_sharded_dataset(
         elif Path("./data/MOT17_sample").exists():
             data_root = "./data/MOT17_sample"
 
+    sid = args.shard_id if shard_id is None else shard_id
+    nsh = args.num_shards if num_shards is None else num_shards
     if data_root and Path(data_root).exists():
         stride = max(1, args.clip_len // 2) if is_train else args.clip_len
         real_ds = RealVCMVideoDataset(
             data_root=data_root,
-            shard_id=args.shard_id,
-            num_shards=args.num_shards,
+            shard_id=sid,
+            num_shards=nsh,
             clip_len=args.clip_len,
             stride=stride,
             img_size=args.img_size,
             is_train=is_train,
             enforce_disjoint_split=getattr(args, "disjoint_split", True),
+            split=split,
         )
         if len(real_ds) > 0:
-            split_tag = "TRAIN" if is_train else "HELD-OUT TEST"
+            split_tag = (split or ("train" if is_train else "test")).upper()
             print(
                 f"[Dataset] Loaded {len(real_ds)} real MOT17/VCM clips [{split_tag}] "
                 f"({len(real_ds) * args.clip_len} frames, stride={stride}) from '{data_root}' "
-                f"for shard {args.shard_id}/{args.num_shards}"
+                f"for shard {sid}/{nsh}"
             )
             return real_ds
 
@@ -234,7 +242,14 @@ def run_train_shard(args: argparse.Namespace) -> None:
         f"Variant={args.variant} | Device={device} (GPUs={n_gpus})"
     )
 
-    dataset = build_sharded_dataset(args, is_train=True, default_virtual_mult=20)
+    dataset = build_sharded_dataset(
+        args,
+        is_train=True,
+        default_virtual_mult=20,
+        split="train",
+        shard_id=args.data_shard_id if args.data_shard_id >= 0 else None,
+        num_shards=args.data_num_shards if args.data_num_shards > 0 else None,
+    )
     loader = DataLoader(
         dataset, batch_size=args.batch_size, shuffle=True, num_workers=2, pin_memory=True
     )
@@ -265,6 +280,68 @@ def run_train_shard(args: argparse.Namespace) -> None:
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="min", factor=0.5, patience=max(1, args.patience // 3)
+    )
+
+    # Validation on a sequence-disjoint split (MOT17-09) for convergence detection; test is never used here.
+    val_ds = None
+    if args.patience > 0:
+        val_candidate = build_sharded_dataset(
+            args, is_train=False, split="val", shard_id=0, num_shards=1
+        )
+        if isinstance(val_candidate, RealVCMVideoDataset) and len(val_candidate) > 0:
+            val_ds = torch.utils.data.Subset(
+                val_candidate, list(range(0, len(val_candidate), max(1, args.val_subsample)))
+            )
+    VAL_SEVERITIES = (0.3, 0.7)
+
+    @torch.no_grad()
+    def validate() -> float:
+        model.eval()
+        total, count = 0.0, 0
+        for vb in DataLoader(val_ds, batch_size=args.batch_size, shuffle=False):
+            v_video = vb["video"].to(device)
+            v_attn = vb["m_attn"].to(device)
+            v_det = vb["m_det"].to(device)
+            vb_n, vt, _, vh, vw = v_video.shape
+            for sev_val in VAL_SEVERITIES:
+                v_sev = torch.full((vb_n,), sev_val, device=device, dtype=torch.float32)
+                v_fam = torch.zeros((vb_n,), device=device, dtype=torch.long)
+                v_out = model(
+                    v_video,
+                    v_fam,
+                    v_sev,
+                    reuse_iframe_qp=preset_cfg["reuse_iframe_qp"],
+                    disable_temporal=(args.variant == "spatial_only_scope"),
+                )
+                v_codec = codec_ste(v_out["i_edit"], v_sev, v_out["ctu_qp_offsets"])
+                v_teacher = fpn_teacher.extract_fpn_features(v_video.view(vb_n * vt, 3, vh, vw))
+                v_student = fpn_teacher.extract_fpn_features(
+                    v_codec["video_recon"].view(vb_n * vt, 3, vh, vw)
+                )
+                v_losses = criterion(
+                    i_edit=v_out["i_edit"],
+                    i_recon=v_codec["video_recon"],
+                    attn_map=v_out["attn_map"],
+                    delta_obj=v_out["delta_obj"],
+                    delta_bg=v_out["delta_bg"],
+                    rate_proxy_bpp=v_codec["rate_proxy_bpp"],
+                    m_attn=v_attn,
+                    m_det=v_det,
+                    teacher_fpn_feats=v_teacher,
+                    student_fpn_feats=v_student,
+                )
+                total += float(v_losses["loss_total"].item())
+                count += 1
+        model.train()
+        return total / max(1, count)
+
+    best_val = float("inf")
+    best_epoch = 0
+    best_state = None
+    epochs_since_best = 0
+    stopped_early = False
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -330,8 +407,28 @@ def run_train_shard(args: argparse.Namespace) -> None:
         )
         history.append({"epoch": epoch, "loss_total": avg_loss, "time_sec": dt})
 
+        if val_ds is not None and (epoch % args.val_every == 0 or epoch == args.epochs):
+            val_loss = validate()
+            scheduler.step(val_loss)
+            history[-1]["val_loss"] = val_loss
+            history[-1]["lr"] = optimizer.param_groups[0]["lr"]
+            improved = val_loss < best_val - args.min_delta
+            print(
+                f"    [Val] epoch {epoch:03d} val_loss={val_loss:.4f} best={best_val:.4f} "
+                f"lr={optimizer.param_groups[0]['lr']:.2e} {'*' if improved else ''}"
+            )
+            if improved:
+                best_val, best_epoch, epochs_since_best = val_loss, epoch, 0
+                best_state = {k: v.detach().cpu().clone() for k, v in base_model.state_dict().items()}
+            else:
+                epochs_since_best += args.val_every
+            if epoch >= args.min_epochs and epochs_since_best >= args.patience:
+                stopped_early = True
+                print(f"  Converged: no val improvement for {epochs_since_best} epochs. Stop at epoch {epoch}.")
+                break
+
     ckpt_path = out_dir / f"tscope_{args.variant}_shard{args.shard_id:02d}of{args.num_shards:02d}.pt"
-    raw_state = base_model.state_dict()
+    raw_state = best_state if best_state is not None else base_model.state_dict()
     torch.save(
         {
             "shard_id": args.shard_id,
@@ -339,6 +436,12 @@ def run_train_shard(args: argparse.Namespace) -> None:
             "variant": args.variant,
             "state_dict": raw_state,
             "history": history,
+            "best_epoch": best_epoch,
+            "best_val_loss": best_val if best_state is not None else None,
+            "stopped_early": stopped_early,
+            "epochs_run": len(history),
+            "train_sequences": ["MOT17-02", "MOT17-04", "MOT17-05", "MOT17-10"],
+            "val_sequences": ["MOT17-09"],
         },
         ckpt_path,
     )
@@ -528,7 +631,7 @@ def run_poc_wishlist2_and_eval_shard(args: argparse.Namespace) -> None:
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    json_path = out_dir / f"eval_shard_{args.shard_id:02d}of{args.num_shards:02d}.json"
+    json_path = out_dir / f"eval_shard_{args.shard_id:02d}of{args.num_shards:02d}_{args.variant}.json"
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(shard_records, f, indent=2)
     print(f"[Eval Shard {args.shard_id}/{args.num_shards}] Wrote {len(shard_records)} records -> {json_path}")
@@ -551,6 +654,13 @@ def main() -> None:
     parser.add_argument("--enable_x265_ste", action="store_true")
     parser.add_argument("--use_pretrained_fpn", action="store_true", help="Use torchvision Faster R-CNN ResNet50-FPN v2")
     parser.add_argument("--allow_untrained", action="store_true", help="Allow eval_poc without a checkpoint for smoke tests")
+    parser.add_argument("--data_shard_id", type=int, default=-1, help="Train data slice index within this variant (default: shard_id)")
+    parser.add_argument("--data_num_shards", type=int, default=-1, help="Number of train data slices for this variant (default: num_shards)")
+    parser.add_argument("--patience", type=int, default=0, help="Early-stop patience in epochs on val loss (0 disables validation)")
+    parser.add_argument("--val_every", type=int, default=2)
+    parser.add_argument("--val_subsample", type=int, default=2, help="Use every k-th val clip")
+    parser.add_argument("--min_epochs", type=int, default=10)
+    parser.add_argument("--min_delta", type=float, default=0.005, help="Minimum val-loss decrease counted as improvement")
     args = parser.parse_args()
 
     if args.mode == "train":
