@@ -68,6 +68,7 @@ def build_worker_script(
     lr: float = 1e-4,
     git_revision: str = "",
     use_yolov8s: bool = True,
+    grad_accum_steps: int = 2,
 ) -> str:
     """
     Generates the standalone Python script pushed to each Kaggle account's kernel.
@@ -81,11 +82,14 @@ import subprocess
 import sys
 from pathlib import Path
 
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 SHARD_ID = {shard_id}
 NUM_SHARDS = {num_shards}
 VARIANT = "{variant}"
 EPOCHS = {epochs}
 BATCH_SIZE = {batch_size}
+GRAD_ACCUM_STEPS = {grad_accum_steps}
 IMG_SIZE = {img_size}
 RUN_MODE = "{run_mode}"
 DATA_SHARD_ID = {data_shard_id}
@@ -114,6 +118,7 @@ if GIT_REVISION:
 
 env = os.environ.copy()
 env["PYTHONPATH"] = str(repo_dir) + os.pathsep + env.get("PYTHONPATH", "")
+env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 ckpt_path = f"/kaggle/working/tscope_{{VARIANT}}_shard{{SHARD_ID:02d}}of{{NUM_SHARDS:02d}}.pt"
 
@@ -129,6 +134,7 @@ if RUN_MODE in ("train", "both"):
         "--variant", VARIANT,
         "--epochs", str(EPOCHS),
         "--batch_size", str(BATCH_SIZE),
+        "--grad_accum_steps", str(GRAD_ACCUM_STEPS),
         "--img_size", str(IMG_SIZE),
         "--lr", str(LR),
         "--patience", str(PATIENCE),
@@ -282,6 +288,7 @@ def push_all_shards(args: argparse.Namespace, accounts: List[Tuple[str, str]]) -
                     lr=args.lr,
                     git_revision=args.git_revision,
                     use_yolov8s=args.use_yolov8s,
+                    grad_accum_steps=getattr(args, "grad_accum_steps", 2),
                 )
                 (tmp_path / "worker.py").write_text(worker_code, encoding="utf-8")
 
@@ -411,7 +418,8 @@ def main() -> None:
     parser.add_argument("--patience", type=int, default=0, help="Early-stop patience on MOT17-09 val loss; 0 = fixed epochs")
     parser.add_argument("--min_epochs", type=int, default=10)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--batch_size", type=int, default=2, help="Per-GPU batch size (2 for 512x512 with dual detectors)")
+    parser.add_argument("--grad_accum_steps", type=int, default=2, help="Gradient accumulation steps (effective batch size = 4)")
     parser.add_argument("--img_size", type=int, default=512)
     parser.add_argument("--max_shards", type=int, default=0, help="0 = use all accounts")
     parser.add_argument("--skip_exhausted", action="store_true", default=True, help="Skip accounts with exhausted weekly GPU quota")

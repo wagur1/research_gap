@@ -365,12 +365,14 @@ def run_train_shard(args: argparse.Namespace) -> None:
         training_configuration["git_revision"] = None
 
     history = []
+    grad_accum_steps = max(1, getattr(args, "grad_accum_steps", 1))
     for epoch in range(1, args.epochs + 1):
         model.train()
         epoch_loss = 0.0
         t0 = time.perf_counter()
 
-        for batch in loader:
+        optimizer.zero_grad(set_to_none=True)
+        for step_idx, batch in enumerate(loader):
             video = batch["video"].to(device)  # [B, T, 3, H, W]
             m_attn = batch["m_attn"].to(device)
             m_det = batch["m_det"].to(device)
@@ -380,7 +382,6 @@ def run_train_shard(args: argparse.Namespace) -> None:
             family_id = torch.zeros((b,), device=device, dtype=torch.long)
             severity = torch.rand((b,), device=device, dtype=torch.float32)
 
-            optimizer.zero_grad(set_to_none=True)
             with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
                 out = model(
                     video,
@@ -412,11 +413,17 @@ def run_train_shard(args: argparse.Namespace) -> None:
                     teacher_fpn_feats=teacher_fpn,
                     student_fpn_feats=student_fpn,
                 )
+                loss_scaled = losses["loss_total"] / grad_accum_steps
 
-            scaler.scale(losses["loss_total"]).backward()
-            scaler.step(optimizer)
-            scaler.update()
+            scaler.scale(loss_scaled).backward()
+            if (step_idx + 1) % grad_accum_steps == 0 or (step_idx + 1) == len(loader):
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
             epoch_loss += float(losses["loss_total"].item())
+
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
         avg_loss = epoch_loss / max(1, len(loader))
         dt = time.perf_counter() - t0
@@ -716,7 +723,8 @@ def main() -> None:
     parser.add_argument("--output_dir", type=str, default="./outputs", help="Output folder")
     parser.add_argument("--ckpt", type=str, default="", help="Optional checkpoint for eval")
     parser.add_argument("--epochs", type=int, default=5)
-    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--batch_size", type=int, default=2)
+    parser.add_argument("--grad_accum_steps", type=int, default=2, help="Gradient accumulation steps")
     parser.add_argument("--clip_len", type=int, default=4)
     parser.add_argument("--img_size", type=int, default=512)
     parser.add_argument("--lr", type=float, default=1e-4)
