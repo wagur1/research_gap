@@ -802,11 +802,18 @@ def run_eval_all_variants_shards(args: argparse.Namespace) -> None:
             v_det_ema = torch.stack(ema_frames, dim=1)
             v_oracle = m_det * video + (1.0 - m_det) * blur_v[:, 0:1].expand_as(blur_v)
 
+            clean_flat = video.view(b * t, 3, h, w)
+            cached_clean_info = {
+                "t_feats": fpn_teacher.extract_fast_pyramid(clean_flat),
+                "clean_dets": fpn_teacher.detector(list(torch.clamp(clean_flat, 0.0, 1.0))),
+            }
+
             def evaluate_encoded(c_out: Dict[str, Any]) -> Dict[str, Any]:
                 recon = c_out["video_recon"]
                 acc = fpn_teacher.evaluate_task_accuracy(
                     video, recon, m_det, gt_boxes=gt_boxes, ignore_boxes=ignore_boxes,
                     require_real_detector=True, return_raw_detections=True,
+                    cached_clean_info=cached_clean_info,
                 )
                 raw_keys = ["gt_boxes", "ignore_boxes", "pred_boxes", "pred_scores"]
                 if "yolo_pred_boxes" in acc["raw_detections"]:
@@ -901,6 +908,8 @@ def run_eval_all_variants_shards(args: argparse.Namespace) -> None:
                             if isinstance(v_rec, float) and not np.isfinite(v_rec):
                                 rec[k_rec] = None
                         records_by_variant[variant].append(rec)
+            if (idx + 1) % 5 == 0 or (idx + 1) == len(dataset):
+                print(f"[Eval All Variants Shard {sid:02d}] Clip {idx + 1}/{len(dataset)} ({time.perf_counter() - t_shard:.1f}s)", flush=True)
 
         for variant in VARIANTS:
             metadata = {
