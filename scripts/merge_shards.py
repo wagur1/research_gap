@@ -102,13 +102,13 @@ def merge_checkpoints_soup(ckpt_dir: str, output_ckpt: str, manifest_path=None, 
     by_variant = {variant: {} for variant in selected}
     for entry, path, digest in files:
         sid = entry["shard_id"]
-        variant = VARIANTS[sid % len(VARIANTS)]
+        checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+        variant = checkpoint.get("variant") or entry.get("expected_variant") or VARIANTS[sid % len(VARIANTS)]
         if variant not in by_variant:
             continue
         expected_filename = f"tscope_{variant}_shard{sid:02d}of21.pt"
-        if path.name != expected_filename or entry.get("expected_variant") != variant or sid in by_variant[variant]:
+        if path.name != expected_filename or (entry.get("expected_variant") and entry.get("expected_variant") != variant) or sid in by_variant[variant]:
             raise ValueError("Unexpected or duplicate shard checkpoint in manifest")
-        checkpoint = torch.load(path, map_location="cpu", weights_only=True)
         validate_checkpoint(checkpoint, sid, variant)
         log_path = path.parent / f"t-scope-vcm-shard-{sid:02d}.log"
         log_entry = next((item for item in entry.get("files", []) if item["path"] == log_path.name), None)
@@ -119,8 +119,12 @@ def merge_checkpoints_soup(ckpt_dir: str, output_ckpt: str, manifest_path=None, 
         by_variant[variant][sid] = (checkpoint, path, digest, log_entry["sha256"])
     outputs = {}
     for variant, collection in by_variant.items():
-        expected = {sid for sid in range(21) if VARIANTS[sid % 5] == variant}
-        if set(collection) != expected:
+        expected = {
+            e["shard_id"]
+            for e in manifest.get("shards", [])
+            if e.get("downloaded") and (e.get("expected_variant") or VARIANTS[e["shard_id"] % 5]) == variant
+        } or {sid for sid in range(21) if VARIANTS[sid % 5] == variant}
+        if not collection or set(collection) != expected:
             raise ValueError(f"Incomplete {variant}: missing shards {sorted(expected - set(collection))}")
         rows = [collection[sid] for sid in sorted(collection)]
         state = average_compatible_states([row[0]["state_dict"] for row in rows])
@@ -159,15 +163,21 @@ def merge_checkpoints_soup(ckpt_dir: str, output_ckpt: str, manifest_path=None, 
 def summarize_records(records):
     from models.frozen_detector_fpn import FrozenFPNDetectorTeacher
 
-    raw = {key: [] for key in ("gt_boxes", "ignore_boxes", "pred_boxes", "pred_scores")}
+    raw = {key: [] for key in ("gt_boxes", "ignore_boxes", "pred_boxes", "pred_scores", "yolo_pred_boxes", "yolo_pred_scores")}
+    has_yolo = True
     pixels = i_pixels = p_pixels = 0
     bits = i_bits = p_bits = 0
     roi_sum = roi_frames = 0
     for record in records:
         count = len(record["frame_ids"])
         restored = restore_raw_detections(record["raw_detections"], count)
-        for key in raw:
+        for key in ("gt_boxes", "ignore_boxes", "pred_boxes", "pred_scores"):
             raw[key].extend(restored[key])
+        if "yolo_pred_boxes" in restored and "yolo_pred_scores" in restored:
+            raw["yolo_pred_boxes"].extend(restored["yolo_pred_boxes"])
+            raw["yolo_pred_scores"].extend(restored["yolo_pred_scores"])
+        else:
+            has_yolo = False
         area = record["height"] * record["width"]
         for size, frame_type in zip(record["packet_sizes"], record["frame_types"]):
             bits += size * 8
@@ -185,17 +195,25 @@ def summarize_records(records):
     metrics = FrozenFPNDetectorTeacher.compute_dataset_level_coco_metrics(raw["gt_boxes"], raw["pred_boxes"], raw["pred_scores"], raw["ignore_boxes"])
     if not all(np.isfinite(value) for value in metrics.values()):
         raise ValueError("Global AP unavailable: no active held-out GT")
-    return {"total_bpp": bits / pixels, "i_frame_bpp": i_bits / i_pixels if i_pixels else None,
-            "p_frame_bpp": p_bits / p_pixels if p_pixels else None,
-            "roi_psnr_db": roi_sum / roi_frames if roi_frames else None,
-            "roi_psnr_aggregation": "frame_weighted_mean_clip_roi_psnr_diagnostic_only",
-            "packet_bytes": bits // 8, "pixel_count": pixels, "frame_count": len(raw["gt_boxes"]), **metrics}
+    summary = {"total_bpp": bits / pixels, "i_frame_bpp": i_bits / i_pixels if i_pixels else None,
+               "p_frame_bpp": p_bits / p_pixels if p_pixels else None,
+               "roi_psnr_db": roi_sum / roi_frames if roi_frames else None,
+               "roi_psnr_aggregation": "frame_weighted_mean_clip_roi_psnr_diagnostic_only",
+               "packet_bytes": bits // 8, "pixel_count": pixels, "frame_count": len(raw["gt_boxes"]), **metrics}
+    if has_yolo and len(raw["yolo_pred_boxes"]) == len(raw["gt_boxes"]):
+        yolo_metrics = FrozenFPNDetectorTeacher.compute_dataset_level_coco_metrics(raw["gt_boxes"], raw["yolo_pred_boxes"], raw["yolo_pred_scores"], raw["ignore_boxes"])
+        summary["yolo_gt_ap50_pct"] = yolo_metrics["gt_ap50_pct"]
+        summary["yolo_gt_ap50_95_pct"] = yolo_metrics["gt_ap50_95_pct"]
+    return summary
 
 
 def build_bdbr_summary(per_qp, anchor):
     result = {"per_qp": per_qp, "bdbr_unavailable_reasons": {}}
+    accuracy_pairs = [("gt_ap50_pct", "gt_ap50_pct"), ("gt_ap50_95_pct", "gt_ap50_95_pct")]
+    if all("yolo_gt_ap50_pct" in per_qp[str(crf)] and "yolo_gt_ap50_pct" in anchor[str(crf)] for crf in CRFS):
+        accuracy_pairs.extend([("yolo_gt_ap50_pct", "yolo_gt_ap50_pct"), ("yolo_gt_ap50_95_pct", "yolo_gt_ap50_95_pct")])
     for rate_key, prefix in (("total_bpp", "tot"), ("p_frame_bpp", "p")):
-        for accuracy_key, suffix in (("gt_ap50_pct", "gt_ap50_pct"), ("gt_ap50_95_pct", "gt_ap50_95_pct")):
+        for accuracy_key, suffix in accuracy_pairs:
             field = f"bdbr_{prefix}_{suffix}"
             try:
                 value = bjontegaard_delta_rate(

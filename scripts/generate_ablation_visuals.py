@@ -177,15 +177,15 @@ def main(argv=None):
     parser.add_argument("--frame-number", type=int, required=True, help="1-based MOT source frame to display")
     parser.add_argument("--crf", type=int, required=True, help="Must be in the benchmark crfs")
     parser.add_argument("--clip-len", type=int, default=4, help="Preserved evaluation clip length")
-    parser.add_argument("--img-size", type=int, default=256, help="Preserved square evaluation resize, not native resolution")
+    parser.add_argument("--img-size", type=int, default=512, help="Square evaluation resize, not native resolution")
     parser.add_argument("--validate-only", action="store_true", help="Check inputs/soup weights/identity; no inference or figures")
     args = parser.parse_args(argv)
     try:
         bundle = load_benchmark(args.benchmark)
         if args.crf not in bundle["crfs"]:
             raise PlotInputError(f"CRF {args.crf} is absent from the benchmark protocol {bundle['crfs']}")
-        if args.clip_len != 4 or args.img_size != 256:
-            raise PlotInputError("Approved preserved evaluation settings require clip_len=4 and img_size=256; no silent resize change")
+        if args.clip_len != 4 or args.img_size not in (256, 512):
+            raise PlotInputError("Approved evaluation settings require clip_len=4 and img_size in {256, 512}")
         if not args.data_root.is_dir():
             raise PlotInputError(f"Missing real held-out data directory: {args.data_root}")
         paths = parse_checkpoints(args.checkpoint)

@@ -38,7 +38,7 @@ def extract_validation_features(teacher, images, chunk_size=1):
 
 @torch.no_grad()
 def validate(args):
-    dataset = RealVCMVideoDataset(args.data_root, shard_id=0, num_shards=1, clip_len=4, stride=4, img_size=256, is_train=False, enforce_disjoint_split=True, split="val")
+    dataset = RealVCMVideoDataset(args.data_root, shard_id=0, num_shards=1, clip_len=4, stride=4, img_size=VALIDATION_PROTOCOL["img_size"], is_train=False, enforce_disjoint_split=True, split="val")
     if len(dataset) != VALIDATION_PROTOCOL["full_clips"] or any(meta["type"] != "mot_frames" or meta["seq_name"].split("-FRCNN")[0] != "MOT17-09" for meta in dataset.clips):
         raise ValueError("Release validation requires all 131 complete MOT17-09 clips (524 frames), not the four-frame local visualization subset")
     frame_paths = [path for meta in dataset.clips for path in meta["frame_paths"]]

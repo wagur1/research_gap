@@ -167,8 +167,8 @@ class BenchmarkInputTests(unittest.TestCase):
     def test_preserved_codec_grid_is_labelled_distinctly(self):
         caption = curves.codec_caption(bundle_fixture())
         self.assertIn("QG=16 px", caption)
-        self.assertIn("8x8 regions", caption)
-        self.assertIn("[-0.18, +0.06]", caption)
+        self.assertIn("16x16 regions", caption)
+        self.assertIn("[-0.18, +0.14]", caption)
         for key in curves.PRESERVED_CODEC_SETTINGS:
             bundle = bundle_fixture()
             bundle["configuration"]["codec"][key] = 123

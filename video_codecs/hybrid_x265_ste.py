@@ -113,8 +113,8 @@ class DifferentiableVideoProxy(nn.Module):
         for step in range(t):
             if ctu_qp_offsets is not None:
                 d_qp = ctu_qp_offsets[:, step].unsqueeze(1)  # [B, 1, H_qg, W_qg]
-                # Match the 8x8 macro-CTU resolution of the real ffmpeg addroi filtergraph (R05 fix)
-                gh, gw = min(8, h // 16), min(8, w // 16)
+                # Match the 16x16 macro-CTU resolution of the real ffmpeg addroi filtergraph
+                gh, gw = min(16, h // 16), min(16, w // 16)
                 d_qp_macro = F.interpolate(
                     d_qp, size=(gh, gw), mode="bilinear", align_corners=False
                 )
@@ -196,34 +196,52 @@ class HybridX265STE(nn.Module):
             return []
 
         t_frames = grid_t.shape[0]
-        gh, gw = min(8, h // 16), min(8, w // 16)
-        grid_8x8 = F.interpolate(grid_t, size=(gh, gw), mode="bilinear", align_corners=False)[:, 0]  # [T, gh, gw]
+        gh, gw = min(16, h // 16), min(16, w // 16)
+        grid_16x16 = F.interpolate(grid_t, size=(gh, gw), mode="bilinear", align_corners=False)[:, 0]  # [T, gh, gw]
         cell_h, cell_w = h // gh, w // gw
 
         def build_frame_rois(frame_grid: torch.Tensor) -> List[str]:
             rois: List[str] = []
             for r in range(gh):
-                for c in range(gw):
+                y0 = r * cell_h
+                bh = (h - y0) if r == gh - 1 else cell_h
+                c = 0
+                while c < gw:
                     d_qp = float(frame_grid[r, c].item())
                     if abs(d_qp) < 0.15:
+                        c += 1
                         continue
                     # In ffmpeg addroi, qoffset in [-1, 1] scales quantizer range (51 QP steps in HEVC).
-                    # Cap positive background coarsening at +0.06 (+3 QP) so overall bitrate does not collapse,
-                    # while allowing up to -0.18 (-9 QP) for high-importance foreground ROI blocks.
-                    qoff = max(-0.18, min(0.06, d_qp / 51.0))
-                    y0, x0 = r * cell_h, c * cell_w
-                    bh = (h - y0) if r == gh - 1 else cell_h
-                    bw = (w - x0) if c == gw - 1 else cell_w
+                    # Allow up to +0.14 (+7.14 QP) for background coarsening and up to -0.18 (-9.18 QP)
+                    # for high-importance foreground ROI blocks.
+                    qoff = max(-0.18, min(0.14, d_qp / 51.0))
+                    # Merge horizontally adjacent cells with virtually identical qoffset (<= 0.005)
+                    # to keep the addroi filter chain compact at 16x16 resolution.
+                    c_end = c + 1
+                    qoff_sum = qoff
+                    while c_end < gw:
+                        d_qp_next = float(frame_grid[r, c_end].item())
+                        if abs(d_qp_next) < 0.15:
+                            break
+                        qoff_next = max(-0.18, min(0.14, d_qp_next / 51.0))
+                        if abs(qoff_next - qoff) > 0.005:
+                            break
+                        qoff_sum += qoff_next
+                        c_end += 1
+                    qoff_avg = qoff_sum / float(c_end - c)
+                    x0 = c * cell_w
+                    bw = (w - x0) if c_end == gw else (c_end - c) * cell_w
                     clear_flag = 1 if len(rois) == 0 else 0
                     rois.append(
-                        f"addroi=x={x0}:y={y0}:w={bw}:h={bh}:qoffset={qoff:.5f}:clear={clear_flag}"
+                        f"addroi=x={x0}:y={y0}:w={bw}:h={bh}:qoffset={qoff_avg:.5f}:clear={clear_flag}"
                     )
+                    c = c_end
             return rois
 
         # Check if all T frames share an identical map (e.g., t=1 or iwa_gop_qp_reuse)
-        all_same = t_frames == 1 or bool((grid_8x8 - grid_8x8[0:1]).abs().max().item() < 1e-5)
+        all_same = t_frames == 1 or bool((grid_16x16 - grid_16x16[0:1]).abs().max().item() < 1e-5)
         if all_same:
-            rois_0 = build_frame_rois(grid_8x8[0])
+            rois_0 = build_frame_rois(grid_16x16[0])
             return ["-vf", ",".join(rois_0)] if rois_0 else []
 
         # Build exact per-frame dynamic ROI filtergraph via split + select + addroi + interleave
@@ -232,7 +250,7 @@ class HybridX265STE(nn.Module):
         out_pads = "".join(f"[v{i}]" for i in range(t_frames))
         any_roi = False
         for i in range(t_frames):
-            f_rois = build_frame_rois(grid_8x8[i])
+            f_rois = build_frame_rois(grid_16x16[i])
             if f_rois:
                 any_roi = True
                 chain = ",".join([f"select='eq(n,{i})'"] + f_rois)
@@ -275,6 +293,14 @@ class HybridX265STE(nn.Module):
             raw_out = Path(tmpdir) / "out.rgb"
             frames_np.tofile(str(raw_in))
 
+            # If the filtergraph string exceeds 8,000 chars (e.g., dense 16x16 per-frame ROIs on Windows
+            # where CreateProcess caps command lines at 32,767 chars), pass it via a temporary file (`-/vf <path>`).
+            vf_cli_args = vf_args
+            if len(vf_args) == 2 and vf_args[0] == "-vf" and len(vf_args[1]) > 8000:
+                vf_script = Path(tmpdir) / "vf_script.txt"
+                vf_script.write_text(vf_args[1], encoding="utf-8")
+                vf_cli_args = ["-/vf", str(vf_script)]
+
             # Use IPPP Low-Delay structure (bframes=0, keyint=t) and crf=qp with aq-mode=2
             # so libx265 honors AV_FRAME_DATA_REGIONS_OF_INTEREST -> x265_picture.quantOffsets
             x265_params = (
@@ -297,7 +323,7 @@ class HybridX265STE(nn.Module):
                     "-i",
                     str(raw_in),
                 ]
-                + vf_args
+                + vf_cli_args
                 + [
                     "-c:v",
                     "libx265",

@@ -12,8 +12,8 @@ from pathlib import Path
 EXPECTED_CRFS = [22, 27, 32, 37]
 PRESERVED_CODEC_SETTINGS = {
     "qg_size": 16,
-    "actual_roi_grid_max": 8,
-    "positive_qoffset_cap": 0.06,
+    "actual_roi_grid_max": 16,
+    "positive_qoffset_cap": 0.14,
     "negative_qoffset_cap": -0.18,
 }
 CURVE_FIELDS = {

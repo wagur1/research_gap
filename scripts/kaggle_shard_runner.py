@@ -272,7 +272,10 @@ def run_train_shard(args: argparse.Namespace) -> None:
         use_real_x265_in_forward=preset_cfg["use_real_x265_ste"] and args.enable_x265_ste
     ).to(device)
 
-    fpn_teacher = FrozenFPNDetectorTeacher(pretrained=args.use_pretrained_fpn).to(device)
+    fpn_teacher = FrozenFPNDetectorTeacher(
+        pretrained=args.use_pretrained_fpn,
+        use_yolov8s=getattr(args, "use_yolov8s", False),
+    ).to(device)
 
     criterion = VCMTemporalPreEditLoss(
         lambda_temp_bg=preset_cfg["lambda_temp_bg"],
@@ -501,8 +504,8 @@ def run_poc_wishlist2_and_eval_shard(args: argparse.Namespace) -> None:
     if not isinstance(dataset, RealVCMVideoDataset) or not args.use_pretrained_fpn or not getattr(args, "disjoint_split", True):
         raise RuntimeError("Final evaluation requires real held-out MOT17 data, disjoint splits, and pretrained Faster R-CNN")
     expected_frame_ids = dataset.physical_frame_manifest()
-    if expected_frame_ids != EXPECTED_TEST_FRAME_IDS or args.clip_len != 4 or args.img_size != 256:
-        raise RuntimeError("Final evaluation requires all 1,648 complete-clip MOT17 test frames at the preserved 256px/4-frame protocol")
+    if expected_frame_ids != EXPECTED_TEST_FRAME_IDS or args.clip_len != 4 or args.img_size not in (256, 512):
+        raise RuntimeError("Final evaluation requires all 1,648 complete-clip MOT17 test frames at the 4-frame protocol")
 
     is_real_mot = isinstance(dataset, RealVCMVideoDataset)
     ds_tag = "MOT17_real" if is_real_mot else "synthetic"
@@ -539,7 +542,10 @@ def run_poc_wishlist2_and_eval_shard(args: argparse.Namespace) -> None:
     spatial_model.eval()
 
     codec = HybridX265STE(use_real_x265_in_forward=True).to(device)
-    fpn_teacher = FrozenFPNDetectorTeacher(pretrained=args.use_pretrained_fpn).to(device)
+    fpn_teacher = FrozenFPNDetectorTeacher(
+        pretrained=args.use_pretrained_fpn,
+        use_yolov8s=getattr(args, "use_yolov8s", False),
+    ).to(device)
     if not fpn_teacher.use_torchvision or fpn_teacher.detector is None:
         raise RuntimeError("Final AP requires actual pretrained Faster R-CNN weights; detector fallback is forbidden")
     qps = CRFS
@@ -548,7 +554,12 @@ def run_poc_wishlist2_and_eval_shard(args: argparse.Namespace) -> None:
         "checkpoint_sha256": sha256_file(args.ckpt), "spatial_checkpoint_sha256": sha256_file(spatial_ckpt),
         "crfs": CRFS, "dataset": "MOT17", "split": "test", "expected_frame_ids": expected_frame_ids,
         "excluded_tail_frame_ids": EXCLUDED_TEST_TAIL_FRAME_IDS,
-        "detector": {"name": "fasterrcnn_resnet50_fpn_v2", "pretrained": True, "weights": "FasterRCNN_ResNet50_FPN_V2_Weights.DEFAULT"},
+        "detector": {
+            "name": "fasterrcnn_resnet50_fpn_v2",
+            "pretrained": True,
+            "weights": "FasterRCNN_ResNet50_FPN_V2_Weights.DEFAULT",
+            "yolov8s": bool(fpn_teacher.use_yolov8s),
+        },
         "codec": CODEC_CONFIGURATION, "metric_policy": METRIC_POLICY,
         "preprocessing": {"resize": "bilinear_square", "img_size": args.img_size, "clip_len": args.clip_len, "stride": args.clip_len, "tail_policy": "complete_nonoverlapping_clips_only"},
         "soup_validation": ckpt["validation"],
@@ -649,6 +660,10 @@ def run_poc_wishlist2_and_eval_shard(args: argparse.Namespace) -> None:
                     require_real_detector=True, return_raw_detections=True,
                 )
 
+                raw_det_keys = ["gt_boxes", "ignore_boxes", "pred_boxes", "pred_scores"]
+                if "yolo_pred_boxes" in acc_metrics["raw_detections"]:
+                    raw_det_keys.extend(["yolo_pred_boxes", "yolo_pred_scores"])
+
                 shard_records.append(
                     {
                         "shard_id": args.shard_id,
@@ -662,13 +677,15 @@ def run_poc_wishlist2_and_eval_shard(args: argparse.Namespace) -> None:
                         "frame_types": c_out["frame_types"],
                         "height": h,
                         "width": w,
-                        "raw_detections": {key: [value.tolist() for value in acc_metrics["raw_detections"][key]] for key in ("gt_boxes", "ignore_boxes", "pred_boxes", "pred_scores")},
+                        "raw_detections": {key: [value.tolist() for value in acc_metrics["raw_detections"][key]] for key in raw_det_keys},
                         "method": method_name,
                         "total_bpp": round(total_bpp, 5),
                         "i_frame_bpp": round(i_frame_bpp, 5),
                         "p_frame_bpp": round(p_frame_bpp, 5),
                         "gt_ap50_pct": acc_metrics["gt_ap50_pct"],
                         "gt_ap50_95_pct": acc_metrics["gt_ap50_95_pct"],
+                        "yolo_gt_ap50_pct": acc_metrics.get("yolo_gt_ap50_pct"),
+                        "yolo_gt_ap50_95_pct": acc_metrics.get("yolo_gt_ap50_95_pct"),
                         "teacher_ap50_pct": acc_metrics["teacher_ap50_pct"],
                         "map50_pct": acc_metrics["map50_pct"],
                         "map50_95_pct": acc_metrics["map50_95_pct"],
@@ -701,10 +718,11 @@ def main() -> None:
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--clip_len", type=int, default=4)
-    parser.add_argument("--img_size", type=int, default=256)
+    parser.add_argument("--img_size", type=int, default=512)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--enable_x265_ste", action="store_true")
     parser.add_argument("--use_pretrained_fpn", action="store_true", help="Use torchvision Faster R-CNN ResNet50-FPN v2")
+    parser.add_argument("--use_yolov8s", action="store_true", help="Also use Ultralytics YOLOv8s for dual-detector feature loss and AP evaluation")
     parser.add_argument("--allow_untrained", action="store_true", help="Allow eval_poc without a checkpoint for smoke tests")
     parser.add_argument("--data_shard_id", type=int, default=-1, help="Train data slice index within this variant (default: shard_id)")
     parser.add_argument("--data_num_shards", type=int, default=-1, help="Number of train data slices for this variant (default: num_shards)")

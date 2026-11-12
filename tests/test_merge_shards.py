@@ -134,7 +134,7 @@ class PairedMergeTests(unittest.TestCase):
         protocol_patcher.start()
         self.addCleanup(protocol_patcher.stop)
         self.validation = {"status": "validated", "release_ready": True, "split": "MOT17-09", "loss_total": 1.0,
-                           "protocol": {"full_clips": 131, "val_subsample": 2, "batch_size": 8, "severities": [0.3, 0.7], "img_size": 256, "aggregation": "mean_batch_severity_loss_matching_training", "held_out_test_used": False},
+                           "protocol": {"full_clips": 131, "val_subsample": 2, "batch_size": 8, "severities": [0.3, 0.7], "img_size": 512, "aggregation": "mean_batch_severity_loss_matching_training", "held_out_test_used": False},
                            "data_fingerprints": {"gt_sha256": "a" * 64, "frames": [{"frame": number, "sha256": "b" * 64} for number in range(1, 525)]}, "source_soup_sha256": "c" * 64, "selection": "uniform_soup_no_test_selection"}
 
     def tearDown(self):

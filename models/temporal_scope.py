@@ -184,12 +184,20 @@ class TemporalSCOPE(nn.Module):
             attn_flat, kernel_size=self.qg_size, stride=self.qg_size
         )  # [B*T, 1, H_qg, W_qg]
         mean_attn = qg_attn.mean(dim=(-2, -1), keepdim=True)
-        std_attn = qg_attn.std(dim=(-2, -1), keepdim=True)
-        # Zero-mean spatial contrast across the QG grid: foreground gets negative Delta-QP (finer quantization),
-        # background gets positive Delta-QP (coarser quantization), without shifting average frame bitrate
-        z_score = (mean_attn - qg_attn) / torch.clamp(2.5 * std_attn, min=0.05)
-        delta_qp = self.max_delta_qp * torch.clamp(z_score, -1.0, 1.0)
-        delta_qp = delta_qp - delta_qp.mean(dim=(-2, -1), keepdim=True)
+        min_attn = qg_attn.amin(dim=(-2, -1), keepdim=True)
+        max_attn = qg_attn.amax(dim=(-2, -1), keepdim=True)
+
+        # Asymmetric foreground/background rate allocation:
+        #   - Foreground (qg_attn >= mean_attn): negative Delta-QP in [-max_delta_qp, 0] (up to -4.0 QP)
+        #   - Background (qg_attn < mean_attn): positive Delta-QP in [0, +1.8 * max_delta_qp] (up to +7.2 QP -> qoffset +0.14)
+        # Because pedestrian ROIs occupy only 10-20% of the frame, symmetric zero-mean normalization
+        # capped background Delta-QP at < +2.5 QP (+0.05 qoffset). Asymmetric normalization allows
+        # pure background blocks to reach +6..+8 QP (+0.12..+0.14 qoffset) for strong bitrate savings.
+        fg_denom = torch.clamp(max_attn - mean_attn, min=0.05)
+        bg_denom = torch.clamp(mean_attn - min_attn, min=0.05)
+        fg_norm = torch.clamp((qg_attn - mean_attn) / fg_denom, 0.0, 1.0)
+        bg_norm = torch.clamp((mean_attn - qg_attn) / bg_denom, 0.0, 1.0)
+        delta_qp = self.max_delta_qp * (1.8 * bg_norm - 1.0 * fg_norm)
         delta_qp = delta_qp.view(b, t, delta_qp.shape[-2], delta_qp.shape[-1])
 
         if reuse_iframe_across_gop and t > 1:

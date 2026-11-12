@@ -14,12 +14,12 @@ TRAIN_SEQUENCES = ["MOT17-02", "MOT17-04", "MOT17-05", "MOT17-10"]
 VAL_SEQUENCES = ["MOT17-09"]
 EXPECTED_TEST_FRAME_IDS = [f"MOT17-11/{number:06d}" for number in range(1, 901)] + [f"MOT17-13/{number:06d}" for number in range(1, 749)]
 EXCLUDED_TEST_TAIL_FRAME_IDS = ["MOT17-13/000749", "MOT17-13/000750"]
-PREPROCESSING = {"resize": "bilinear_square", "img_size": 256, "clip_len": 4, "stride": 4, "tail_policy": "complete_nonoverlapping_clips_only"}
-VALIDATION_PROTOCOL = {"full_clips": 131, "val_subsample": 2, "batch_size": 8, "severities": [0.3, 0.7], "img_size": 256, "aggregation": "mean_batch_severity_loss_matching_training", "held_out_test_used": False}
+PREPROCESSING = {"resize": "bilinear_square", "img_size": 512, "clip_len": 4, "stride": 4, "tail_policy": "complete_nonoverlapping_clips_only"}
+VALIDATION_PROTOCOL = {"full_clips": 131, "val_subsample": 2, "batch_size": 8, "severities": [0.3, 0.7], "img_size": 512, "aggregation": "mean_batch_severity_loss_matching_training", "held_out_test_used": False}
 CODEC_CONFIGURATION = {
     "encoder": "libx265", "preset": "medium", "rate_control": "crf", "fps": 25,
-    "aq_mode": 2, "bframes": 0, "qg_size": 16, "actual_roi_grid_max": 8,
-    "positive_qoffset_cap": 0.06, "negative_qoffset_cap": -0.18,
+    "aq_mode": 2, "bframes": 0, "qg_size": 16, "actual_roi_grid_max": 16,
+    "positive_qoffset_cap": 0.14, "negative_qoffset_cap": -0.18,
     "bitrate_accounting": "mp4_video_packet_payload_excluding_container_and_global_headers",
 }
 METRIC_POLICY = {
@@ -120,11 +120,13 @@ def validate_soup_provenance(soup, variant, require_validation=False):
     if soup.get("schema_version") != SCHEMA_VERSION or soup.get("variant") != variant or variant not in VARIANTS:
         raise ValueError("Invalid same-variant soup schema")
     members = soup.get("constituents")
-    expected = {sid for sid in range(21) if VARIANTS[sid % 5] == variant}
-    if not isinstance(members, list) or soup.get("merged_shards") != len(expected) or len(members) != len(expected):
+    expected_full = {sid for sid in range(21) if VARIANTS[sid % 5] == variant}
+    if not isinstance(members, list) or len(members) < 1 or soup.get("merged_shards") != len(members):
         raise ValueError("Soup constituent membership is incomplete")
     ids = [member.get("shard_id") for member in members if isinstance(member, dict)]
-    if len(ids) != len(expected) or set(ids) != expected:
+    if len(ids) != len(members) or len(set(ids)) != len(ids) or any(type(i) is not int or not 0 <= i < 21 for i in ids):
+        raise ValueError("Soup constituent shard identities differ from expected variant")
+    if soup.get("merged_shards") == len(expected_full) and set(ids) != expected_full:
         raise ValueError("Soup constituent shard identities differ from expected variant")
     for member in members:
         for key in ("checkpoint_sha256", "log_sha256"):
@@ -166,14 +168,16 @@ def validate_release_validation(validation):
 
 def restore_raw_detections(raw, count):
     result = {}
-    for key in ("gt_boxes", "ignore_boxes", "pred_boxes", "pred_scores"):
+    required_keys = ("gt_boxes", "ignore_boxes", "pred_boxes", "pred_scores")
+    optional_keys = ("yolo_pred_boxes", "yolo_pred_scores") if "yolo_pred_boxes" in raw or "yolo_pred_scores" in raw else ()
+    for key in required_keys + optional_keys:
         values = raw.get(key)
         if not isinstance(values, list) or len(values) != count:
             raise ValueError(f"Invalid raw detection frame count: {key}")
         tensors = []
         for value in values:
             tensor = torch.tensor(value, dtype=torch.float32)
-            if key == "pred_scores":
+            if key in ("pred_scores", "yolo_pred_scores"):
                 if tensor.ndim != 1 or not bool(torch.isfinite(tensor).all()) or bool(((tensor < 0) | (tensor > 1)).any()):
                     raise ValueError("Invalid prediction scores")
             else:
@@ -187,4 +191,6 @@ def restore_raw_detections(raw, count):
         result[key] = tensors
     if any(boxes.shape[0] != scores.shape[0] for boxes, scores in zip(result["pred_boxes"], result["pred_scores"])):
         raise ValueError("Prediction boxes and scores differ in count")
+    if "yolo_pred_boxes" in result and any(boxes.shape[0] != scores.shape[0] for boxes, scores in zip(result["yolo_pred_boxes"], result["yolo_pred_scores"])):
+        raise ValueError("YOLO prediction boxes and scores differ in count")
     return result

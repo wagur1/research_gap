@@ -81,7 +81,7 @@ class PreservedValidationProtocolTests(unittest.TestCase):
             "val_subsample": 2,
             "batch_size": 8,
             "severities": [0.3, 0.7],
-            "img_size": 256,
+            "img_size": 512,
             "aggregation": "mean_batch_severity_loss_matching_training",
             "held_out_test_used": False,
         })
@@ -329,7 +329,7 @@ class FullValidatorRegressionTests(unittest.TestCase):
                 self.assertEqual(mocks.teacher.call_sizes, [1] * (264 * 3))
                 self.assertEqual(execution["feature_chunk_size"], 1)
                 mocks.dataset_factory.assert_called_once_with(directory, shard_id=0, num_shards=1,
-                    clip_len=4, stride=4, img_size=256, is_train=False, enforce_disjoint_split=True, split="val")
+                    clip_len=4, stride=4, img_size=VALIDATION_PROTOCOL["img_size"], is_train=False, enforce_disjoint_split=True, split="val")
                 self.assertEqual(paths, {"spatial_only_scope": destination / "tscope_soup_spatial_only_scope.pt"})
                 mocks.saved.assert_called_once()
                 self.assertTrue(paths["spatial_only_scope"].is_file())
@@ -388,7 +388,8 @@ class OfflineRealDetectorEquivalenceTests(unittest.TestCase):
         chunked_clean = extract_validation_features(self.teacher, clean, chunk_size=1)
         chunked_reconstructed = extract_validation_features(self.teacher, reconstructed, chunk_size=1)
         self.assertEqual(list(whole_clean), ["p2", "p3", "p4", "p5"])
-        self.assertEqual(tuple(whole_clean["p2"].shape), (2, 256, 64, 64))
+        p2_side = VALIDATION_PROTOCOL["img_size"] // 4
+        self.assertEqual(tuple(whole_clean["p2"].shape), (2, 256, p2_side, p2_side))
         for level in whole_clean:
             with self.subTest(level=level):
                 torch.testing.assert_close(chunked_clean[level], whole_clean[level], rtol=1e-4, atol=1e-5)

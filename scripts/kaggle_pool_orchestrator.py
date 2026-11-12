@@ -67,6 +67,7 @@ def build_worker_script(
     min_epochs: int = 10,
     lr: float = 1e-4,
     git_revision: str = "",
+    use_yolov8s: bool = True,
 ) -> str:
     """
     Generates the standalone Python script pushed to each Kaggle account's kernel.
@@ -93,6 +94,10 @@ PATIENCE = {patience}
 MIN_EPOCHS = {min_epochs}
 LR = {lr}
 GIT_REVISION = {git_revision!r}
+USE_YOLOV8S = {use_yolov8s!r}
+
+if USE_YOLOV8S:
+    subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", "ultralytics"], check=False)
 
 repo_dir = Path("/tmp/research_gap")
 if repo_dir.exists():
@@ -132,6 +137,8 @@ if RUN_MODE in ("train", "both"):
         "--use_pretrained_fpn",
         "--output_dir", "/kaggle/working",
     ]
+    if USE_YOLOV8S:
+        cmd_train.append("--use_yolov8s")
     subprocess.run(cmd_train, cwd=str(repo_dir), env=env, check=True)
 
 if RUN_MODE in ("eval_poc", "both"):
@@ -147,6 +154,8 @@ if RUN_MODE in ("eval_poc", "both"):
         "--use_pretrained_fpn",
         "--output_dir", "/kaggle/working",
     ]
+    if USE_YOLOV8S:
+        cmd_eval.append("--use_yolov8s")
     subprocess.run(cmd_eval, cwd=str(repo_dir), env=env, check=True)
 
 if RUN_MODE == "eval_soup":
@@ -164,6 +173,8 @@ if RUN_MODE == "eval_soup":
             "--use_pretrained_fpn",
             "--output_dir", "/kaggle/working",
         ]
+        if USE_YOLOV8S:
+            cmd_eval.append("--use_yolov8s")
         subprocess.run(cmd_eval, cwd=str(repo_dir), env=env, check=True)
 
 print(f"=== Shard {{SHARD_ID}}/{{NUM_SHARDS}} ({{VARIANT}}) finished successfully! ===")
@@ -207,22 +218,48 @@ def push_all_shards(args: argparse.Namespace, accounts: List[Tuple[str, str]]) -
     num_shards = len(accounts)
     max_Idx = min(num_shards, args.max_shards) if args.max_shards > 0 else num_shards
     print(
-        f"Pushing {max_Idx}/{num_shards} Kaggle GPU kernels "
-        f"(mode={args.run_mode}, dataset={args.dataset_slug})..."
+        f"Pushing up to {max_Idx}/{num_shards} Kaggle GPU kernels "
+        f"(mode={args.run_mode}, dataset={args.dataset_slug}, min_gpu_hours={args.min_gpu_hours:.2f}h)..."
     )
 
-    shard_variants = [
-        ABLATION_ROTATION[s % len(ABLATION_ROTATION)] if args.ablation_sweep else args.variant
-        for s in range(max_Idx)
-    ]
-
+    # Filter out accounts whose weekly GPU quota is exhausted (< args.min_gpu_hours)
+    active_shards: List[Tuple[int, str, str, float]] = []
     for shard_id in range(max_Idx):
         user, token = accounts[shard_id]
-        variant = shard_variants[shard_id]
-        # Each variant's shards partition the train data among themselves, so every variant sees the full train split.
-        same_variant_ids = [s for s in range(max_Idx) if shard_variants[s] == variant]
-        data_shard_id = same_variant_ids.index(shard_id)
-        data_num_shards = len(same_variant_ids)
+        try:
+            api = get_authenticated_api(user, token)
+            q = api.quota_view()
+            used_h = q.gpu_quota.time_used.total_seconds() / 3600.0
+            tot_h = q.gpu_quota.total_time_allowed.total_seconds() / 3600.0
+            rem_h = max(0.0, tot_h - used_h)
+            if args.skip_exhausted and rem_h < args.min_gpu_hours:
+                print(
+                    f"  [Shard {shard_id:02d}/{num_shards:02d}] SKIP {user:<22} "
+                    f"(GPU quota exhausted: {rem_h:.2f}h / {tot_h:.1f}h remaining)"
+                )
+                continue
+            active_shards.append((shard_id, user, token, rem_h))
+        except Exception as e:
+            print(f"  [Shard {shard_id:02d}/{num_shards:02d}] Quota check error on {user}: {e}")
+
+    if not active_shards:
+        print("No active GPU accounts with sufficient quota found!")
+        return
+
+    # Assign variants evenly across the ACTIVE GPU accounts so every ablation variant
+    # gets balanced GPU shards and full training data coverage
+    active_variants = [
+        ABLATION_ROTATION[idx % len(ABLATION_ROTATION)] if args.ablation_sweep else args.variant
+        for idx in range(len(active_shards))
+    ]
+
+    for active_idx, (shard_id, user, token, rem_h) in enumerate(active_shards):
+        variant = active_variants[active_idx]
+        same_variant_indices = [
+            i for i in range(len(active_shards)) if active_variants[i] == variant
+        ]
+        data_shard_id = same_variant_indices.index(active_idx)
+        data_num_shards = len(same_variant_indices)
         slug = f"t-scope-vcm-shard-{shard_id:02d}"
         kernel_id = f"{user}/{slug}"
 
@@ -244,6 +281,7 @@ def push_all_shards(args: argparse.Namespace, accounts: List[Tuple[str, str]]) -
                     min_epochs=args.min_epochs,
                     lr=args.lr,
                     git_revision=args.git_revision,
+                    use_yolov8s=args.use_yolov8s,
                 )
                 (tmp_path / "worker.py").write_text(worker_code, encoding="utf-8")
 
@@ -269,17 +307,9 @@ def push_all_shards(args: argparse.Namespace, accounts: List[Tuple[str, str]]) -
                 res = api.kernels_push(str(tmp_path))
                 ref_url = getattr(res, "url", "") or ""
                 err_msg = getattr(res, "error", "") or ""
-                if not ref_url and ("GPU" in err_msg or "quota" in err_msg.lower()):
-                    metadata["enable_gpu"] = "false"
-                    (tmp_path / "kernel-metadata.json").write_text(
-                        json.dumps(metadata, indent=2), encoding="utf-8"
-                    )
-                    res_cpu = api.kernels_push(str(tmp_path))
-                    ref_url = getattr(res_cpu, "url", "") or ""
-                    err_msg = f"(CPU fallback) {getattr(res_cpu, 'error', '') or ''}"
                 print(
-                    f"  [Shard {shard_id:02d}/{num_shards:02d}] Pushed -> {kernel_id:<38} "
-                    f"| variant={variant:<18} | {ref_url} {err_msg}"
+                    f"  [Shard {shard_id:02d}/{num_shards:02d}] Pushed ({rem_h:5.2f}h rem) -> {kernel_id:<36} "
+                    f"| variant={variant:<18} (slice {data_shard_id+1}/{data_num_shards}) | {ref_url} {err_msg}"
                 )
         except Exception as e:
             print(f"  [Shard {shard_id:02d}/{num_shards:02d}] ERROR on {user}: {e}")
@@ -382,8 +412,11 @@ def main() -> None:
     parser.add_argument("--min_epochs", type=int, default=10)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--batch_size", type=int, default=8)
-    parser.add_argument("--img_size", type=int, default=256)
+    parser.add_argument("--img_size", type=int, default=512)
     parser.add_argument("--max_shards", type=int, default=0, help="0 = use all accounts")
+    parser.add_argument("--skip_exhausted", action="store_true", default=True, help="Skip accounts with exhausted weekly GPU quota")
+    parser.add_argument("--min_gpu_hours", type=float, default=1.0, help="Minimum remaining GPU hours required to dispatch a kernel")
+    parser.add_argument("--use_yolov8s", action="store_true", default=True, help="Enable dual-detector Faster R-CNN + YOLOv8s teacher/evaluator")
     parser.add_argument("--git_revision", default="", help="Full reviewed and published commit hash required for eval_soup")
     parser.add_argument("--output_dir", type=str, default="./outputs_kaggle_pool")
     args = parser.parse_args()

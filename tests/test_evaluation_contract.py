@@ -35,7 +35,7 @@ class EvaluationContractTests(unittest.TestCase):
     def test_dynamic_roi_graph_retains_each_frame(self):
         offsets = torch.zeros(3, 2, 2)
         offsets[0, 0, 0] = -4
-        offsets[1, 1, 1] = 4
+        offsets[1, 1, 1] = 8
         offsets[2, 0, 1] = -2
         args = HybridX265STE._build_addroi_filter_from_offsets(offsets, 32, 32)
         graph = args[1]
@@ -43,7 +43,7 @@ class EvaluationContractTests(unittest.TestCase):
         for index in range(3):
             self.assertIn(f"select='eq(n,{index})'", graph)
         self.assertIn("interleave=n=3", graph)
-        self.assertIn("qoffset=0.06000", graph)
+        self.assertIn("qoffset=0.14000", graph)
 
     @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "Real codec tools unavailable")
     def test_real_codec_integer_packets_and_decode(self):
