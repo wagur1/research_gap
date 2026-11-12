@@ -4,7 +4,7 @@
 
 **Updated:** 2026-11-12
 
-**Status:** COMPLETE — All 21 training shards, all 5 validated Model Soups (`release_ready=true`), all 21 paired `eval_soup` shards (`105/105` JSON outputs across 1,648 held-out test frames on `MOT17-11, 13`), `merged_benchmarks.json`, publication figures (`fig_bdbr_curves`, `fig_ablation_bdbr`, `ablation_preedit_comparison_grid`), and complexity/FPS measurements are completed and verified.
+**Status:** COMPLETE for preserved `256×256` baseline (all 21 training shards, all 5 validated Model Soups, all 105 paired `eval_soup` JSONs across 1,648 held-out test frames on `MOT17-11, 13`, `merged_benchmarks.json`, publication figures, and complexity/FPS report) AND UPGRADED to **`512×512` + `16×16` ROI grid + `qoffset ∈ [-0.18, +0.14]` + asymmetric $\Delta\text{QP}$ + Dual-Detector (`Faster R-CNN ResNet50-FPN v2` + `YOLOv8s`)** (`-23.57%` BDBR on `iwa_gop_qp_reuse`, `-22.35%` BDBR on `full_tscope`, `-58.32%` BDBR on `oracle_gt_mask_upper_bound`; 12 active GPU training shards dispatched on `origin/main`).
 **Decision:** Preserve the running experiment. Do not silently substitute the original brief's proposed 64×64 CTU / ±12 settings.
 
 ## 1. Verified state and final benchmark results

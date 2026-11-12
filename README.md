@@ -59,16 +59,17 @@ $$\text{FiLM}(x, c) = x \odot (1 + \gamma(c)) + \beta(c)$$
    - Khung hình xuất ra:
      $$I_{\text{edit}, t} = A_t \odot I_{\text{obj}, t} + (1 - A_t) \odot I_{\text{bg}, t}$$
 
-### 2.3. Điều phối Lượng tử hóa Khối CTU $\Delta\text{QP}$ từ Bản đồ Chú ý (`compute_ctu_qp_offsets`)
-Kế thừa tư tưởng của **WA-RDO** nhưng thực thi trực tiếp qua giao diện chuẩn `x265_picture.quantOffsets` mà không cần sửa đổi bitstream:
-- Thay vì vứt bỏ bản đồ chú ý $A_t$ sau khi trộn pixel như SCOPE, T-SCOPE hạ mẫu $A_t$ bằng Average Pooling xuống lưới nhóm lượng tử (Quantization Group / CTU kích thước $16\times 16$ hoặc $64\times 64$):
+### 2.3. Điều phối Lượng tử hóa Khối CTU $\Delta\text{QP}$ Bất đối xứng từ Bản đồ Chú ý (`compute_ctu_qp_offsets`)
+Kế thừa tư tưởng của **WA-RDO** nhưng thực thi trực tiếp qua giao diện chuẩn `x265_picture.quantOffsets` (`ffmpeg addroi`) trên lưới **`16×16` vùng** (`32×32 px`/ô ở `512×512`) mà không cần sửa đổi bitstream:
+- Thay vì vứt bỏ bản đồ chú ý $A_t$ sau khi trộn pixel như SCOPE, T-SCOPE hạ mẫu $A_t$ bằng Average Pooling xuống lưới nhóm lượng tử (Quantization Group kích thước $16\times 16$):
   $$A_{t, (u,v)}^{\text{QG}} = \text{AvgPool}_{16\times 16}(A_t)_{(u,v)}$$
-- Tính độ lệch lượng tử hóa cân bằng tổng bằng 0 (Zero-sum $\Delta\text{QP}$):
-  $$\mathbf{\Delta Q}_{t, (u,v)} = \text{clip}\Big(\kappa_{\max} \cdot \big(\bar{A}_t^{\text{QG}} - A_{t, (u,v)}^{\text{QG}}\big), \, -\kappa_{\max}, \, +\kappa_{\max}\Big), \quad \kappa_{\max} = 4.0$$
+- **Phân bổ $\Delta\text{QP}$ bất đối xứng tiền cảnh / hậu cảnh:** Vì người đi bộ trong MOT17 chỉ chiếm $10\%\text{–}20\%$ diện tích khung hình ($\bar{A}_t^{\text{QG}} \approx 0.15$), chuẩn hóa đối xứng zero-mean truyền thống làm vùng nền chỉ tăng tối đa $+2.5\text{ QP}$ (`qoffset` $\le +0.05$). T-SCOPE chuẩn hóa tách biệt hai nhánh tiền cảnh và hậu cảnh quanh $\bar{A}_t^{\text{QG}}$:
+  $$f_{t,(u,v)} = \text{clip}\left(\frac{A_{t,(u,v)}^{\text{QG}} - \bar{A}_t^{\text{QG}}}{\max(A_t^{\text{QG}}) - \bar{A}_t^{\text{QG}}}, 0, 1\right), \quad b_{t,(u,v)} = \text{clip}\left(\frac{\bar{A}_t^{\text{QG}} - A_{t,(u,v)}^{\text{QG}}}{\bar{A}_t^{\text{QG}} - \min(A_t^{\text{QG}})}, 0, 1\right)$$
+  $$\mathbf{\Delta Q}_{t, (u,v)} = \kappa_{\max} \cdot \big(1.8 \, b_{t,(u,v)} - 1.0 \, f_{t,(u,v)}\big) \in [-4.0, \, +7.2]\text{ QP}, \quad \text{qoffset} \in [-0.18, \, +0.14]$$
 - **Cơ chế tác động kép:**
-  - Khối chứa vật thể ($A_{t,(u,v)}^{\text{QG}} > \bar{A}_t^{\text{QG}}$) nhận $\mathbf{\Delta Q} < 0$ $\to$ giảm bước lượng tử và giảm hệ số nhân Lagrange $\lambda_{\text{RDO}} = 0.85 \cdot 2^{(\text{QP} + \Delta Q - 12)/3}$ trong `x265`, bảo toàn cấu trúc tần số cao cho mạng Detector.
-  - Khối thuộc vùng nền ($A_{t,(u,v)}^{\text{QG}} < \bar{A}_t^{\text{QG}}$) vừa đã được làm phẳng ở mức pixel, vừa nhận $\mathbf{\Delta Q} > 0$ trong `x265`.
-  - Hỗ trợ thêm chế độ **IWA-QP (`reuse_iframe_across_gop=True`)**: chỉ tính $\mathbf{\Delta Q}$ tại I-frame và dùng lại cho toàn bộ mini-GOP.
+  - Khối chứa vật thể ($A_{t,(u,v)}^{\text{QG}} > \bar{A}_t^{\text{QG}}$) nhận $\mathbf{\Delta Q} \in [-4.0, 0]\text{ QP}$ $\to$ giảm bước lượng tử và giảm hệ số nhân Lagrange $\lambda_{\text{RDO}} = 0.85 \cdot 2^{(\text{QP} + \Delta Q - 12)/3}$ trong `x265`, bảo toàn cấu trúc tần số cao cho cả 2 họ Detector (**Faster R-CNN ResNet50-FPN v2** và **YOLOv8s**).
+  - Khối thuộc vùng nền ($A_{t,(u,v)}^{\text{QG}} < \bar{A}_t^{\text{QG}}$) vừa được làm phẳng ở mức pixel, vừa nhận $\mathbf{\Delta Q} \in [0, +7.2]\text{ QP}$ (`qoffset` tới $+0.14$) trên lưới `16×16` có gộp run-length ngang, cắt giảm tới $\sim 50\%$ bitrate vùng nền.
+  - Hỗ trợ chế độ **IWA-QP (`reuse_iframe_across_gop=True`)**: chỉ tính $\mathbf{\Delta Q}$ tại I-frame và dùng lại cho toàn bộ mini-GOP.
 
 ### 2.4. Huấn luyện Hybrid Forward-`x265` / Backward-Proxy (Straight-Through Estimator)
 Để xóa bỏ hiện tượng lệch (codec mismatch) giữa bộ mô phỏng và `x265` thật:
@@ -76,12 +77,12 @@ Kế thừa tư tưởng của **WA-RDO** nhưng thực thi trực tiếp qua gi
 - **Backward Pass:** Truyền đạo hàm qua [`DifferentiableVideoProxy`](./video_codecs/hybrid_x265_ste.py) — bộ mô phỏng biến đổi DCT $8\times 8$ có phân biệt mã hóa Intra ($t=0$) và mã hóa phần dư liên khung Inter ($t > 0$, $I_{\text{edit}, t} - \hat{I}_{t-1}$) với bước lượng tử hóa phụ thuộc cả `base_qp` lẫn $\mathbf{\Delta Q}_t$:
   $$\hat{I}_t = \hat{I}_{\text{proxy}, t} + \text{stop\_grad}\big(\hat{I}_{\text{x265}, t} - \hat{I}_{\text{proxy}, t}\big)$$
 
-### 2.5. Hàm Mục tiêu 5 Thành phần (`VCMTemporalPreEditLoss`)
-Chỉ huấn luyện duy nhất mạng `TemporalSCOPE` (**3.80M tham số**), giữ đóng băng hoàn toàn mạng Detector:
+### 2.5. Hàm Mục tiêu 5 Thành phần Đa Detector (`VCMTemporalPreEditLoss` — Faster R-CNN FPN + YOLOv8s CSPDarknet)
+Chỉ huấn luyện duy nhất mạng `TemporalSCOPE` (**3.80M tham số**), giữ đóng băng hoàn toàn cả hai mạng Detector (**Faster R-CNN ResNet50-FPN v2** двух-stage và **YOLOv8s** one-stage anchor-free):
 
 $$\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{task}} + \mathcal{L}_{\text{att}} + \mathcal{L}_{\text{bg}} + \mathcal{L}_{\text{temp}} + \mathcal{L}_{\text{reg}}$$
 
-1. **Task Feature Consistency ($\mathcal{L}_{\text{task}}$):** Khoảng cách Smooth-$L_1$ có mặt nạ $M_{\text{det}, t}^\ell$ giữa đặc trưng FPN của ảnh sạch $F_T^\ell(I_t)$ và ảnh sau giải mã $F_S^\ell(\hat{I}_t)$.
+1. **Dual-Detector Task Feature Consistency ($\mathcal{L}_{\text{task}}$):** Khoảng cách Smooth-$L_1$ có mặt nạ $M_{\text{det}, t}^\ell$ giữa đặc trưng đa tỷ lệ của ảnh sạch $F_T^\ell(I_t)$ và ảnh sau giải mã $F_S^\ell(\hat{I}_t)$ trên cả 4 tầng FPN `{p2, p3, p4, p5}` của **Faster R-CNN ResNet50-FPN v2** lẫn 3 tầng CSPDarknet `{yolo_p3, yolo_p4, yolo_p5}` của **YOLOv8s**.
 2. **Attention Supervision ($\mathcal{L}_{\text{att}}$):** Tổng của Binary Cross-Entropy, Dice Loss giữa $A_t$ với mặt nạ hộp giới hạn chặt $M_{\text{attn}, t}$, và phạt độ thưa trên vùng nền $\|(1 - M_{\text{det}, t}) \odot A_t\|_1$.
 3. **Spatial Background Simplification & Rate ($\mathcal{L}_{\text{bg}}$):** Làm phẳng độ lệch so với ảnh làm mờ và giảm đạo hàm không gian trong vùng $M_{\text{bg}, t} = 1 - M_{\text{det}, t}$ cộng với ước lượng bitrate $\mathcal{L}_{\text{rate}}$.
 4. **Temporal Inter-Frame Residual Suppression ($\mathcal{L}_{\text{temp}}$ — Đóng góp mới cho Video):**
@@ -122,8 +123,8 @@ Không cần mở trình duyệt, chạy trực tiếp trên máy tính cá nhâ
 # 1. Kiểm tra xác thực toàn bộ 21 tài khoản Kaggle
 python scripts/kaggle_pool_orchestrator.py --pool_file "C:\Users\Wagur1\Downloads\pool (2).json" --action verify_pool
 
-# 2. Huấn luyện mới (chỉ sau xác nhận; không thay thế các kernel đang chạy)
-python -I scripts/kaggle_pool_orchestrator.py --pool_file "C:\Users\Wagur1\Downloads\pool (2).json" --action push --run_mode train --epochs 60 --patience 10 --min_epochs 12 --lr 2e-4 --batch_size 8 --ablation_sweep
+# 2. Huấn luyện hội tụ ở 512x512 với Dual-Detector (Faster R-CNN ResNet50-FPN v2 + YOLOv8s), tự động bỏ qua acc hết quota GPU
+python -I scripts/kaggle_pool_orchestrator.py --pool_file "C:\Users\Wagur1\Downloads\pool (2).json" --action push --run_mode train --ablation_sweep --img_size 512 --batch_size 4 --epochs 40 --patience 10 --min_epochs 10 --min_gpu_hours 1.0 --skip_exhausted --use_yolov8s
 
 # 3. Xem trạng thái chạy của cả 21 tài khoản
 python -I scripts/kaggle_pool_orchestrator.py --pool_file "C:\Users\Wagur1\Downloads\pool (2).json" --action status
@@ -217,7 +218,22 @@ Nguồn: `complexity_fps_report.json` (đo trực tiếp trên `TemporalSCOPE` v
 | `iwa_gop_qp_reuse` (Tái sử dụng QG I-frame) | `3.8034 M` | `3.8034 M` | `31.3433` | `62.6866` | `24.33 ms` (`+3.91%`) | `41.10 FPS` |
 | **`full_tscope` (Đầy đủ QG mỗi frame)** | **`3.8034 M`** *(8.7% detector)* | **`3.8034 M`** | **`31.3433`** | **`62.6866`** | **`24.48 ms` (`+4.56%`)** | **`40.85 FPS`** |
 
-### 5.4. Kiểm định Gate 0 (Can thiệp nhân quả, 5/5 PASS) & Đa Detector Pilot
+### 5.4. Kết quả Nâng cấp Độ phân giải `512×512` + Lưới ROI `16×16` + Dải `qoffset ∈ [-0.18, +0.14]` + $\Delta\text{QP}$ Bất đối xứng
+
+Nguồn: [`outputs_kaggle_pool/benchmark_512x512_16x16roi.json`](./outputs_kaggle_pool/benchmark_512x512_16x16roi.json) (đo trên các clip held-out `MOT17-11` và `MOT17-13` tại `CRF = [22, 27, 32, 37]`). Khi nâng độ phân giải từ `256×256` lên **`512×512`**, mở lưới `ffmpeg addroi` từ `8×8` lên **`16×16` vùng** (`32×32 px`/ô có gộp run-length ngang), mở rộng dải `qoffset` lên **`[-0.18, +0.14]`** (`+7.14 QP` ở vùng nền), và áp dụng phân bổ $\Delta\text{QP}$ bất đối xứng tiền cảnh/hậu cảnh, mức tiết kiệm BDBR tăng vọt gấp **2.5× – 3.1×**:
+
+| Phương pháp (`512×512`, `16×16` ROI, `qoffset ∈ [-0.18, +0.14]`) | Total BDBR (`GT AP@50`) | P-Frame BDBR (`GT AP@50`) | Total BDBR (`GT AP@[.50:.95]`) | P-Frame BDBR (`GT AP@[.50:.95]`) | Total BPP (`CRF 22 / 27 / 32 / 37`) | `GT AP@50` (`CRF 22 / 27 / 32 / 37`) |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| `anchor_x265` (Trực tiếp `libx265` ở `512×512`) | `+0.00%` | `+0.00%` | `+0.00%` | `+0.00%` | `0.6258 / 0.3199 / 0.1569 / 0.0755` | `53.85% / 45.43% / 37.91% / 26.08%` |
+| **`full_tscope` (T-SCOPE per-frame `16×16` QG offsets)** | **`-22.35%`** | **`-19.53%`** | **`-17.68%`** | **`-12.71%`** | **`0.3126 / 0.1582 / 0.0780 / 0.0404`** | **`49.86% / 39.65% / 32.27% / 13.39%`** |
+| **`iwa_gop_qp_reuse` (T-SCOPE tái sử dụng QG từ I-frame)** | **`-23.57%`** | **`-21.10%`** | **`-24.44%`** | **`-22.02%`** | `0.6755 / 0.3543 / 0.1799 / 0.0888` | **`56.28% / 51.77% / 41.62% / 32.71%`** |
+| `oracle_gt_mask_upper_bound` (Cận trên, dùng GT) | **`-58.32%`** | **`-51.77%`** | **`-58.11%`** | **`-50.60%`** | `0.1650 / 0.0882 / 0.0469 / 0.0262` | `49.91% / 41.59% / 32.41% / 14.10%` |
+
+- Tại **cùng mức bitrate `~0.31 bpp`**, `full_tscope` ở `CRF 22` (`0.3126 bpp`, `AP@50 = 49.86%`) vượt `anchor_x265` ở `CRF 27` (`0.3199 bpp`, `AP@50 = 45.43%`) tới **`+4.43%` điểm AP@50** và **`+1.94%` điểm AP@[.50:.95]**.
+- Tại **cùng mức bitrate `~0.077 bpp`**, `full_tscope` ở `CRF 32` (`0.0780 bpp`, `AP@50 = 32.27%`) vượt `anchor_x265` ở `CRF 37` (`0.0755 bpp`, `AP@50 = 26.08%`) tới **`+6.19%` điểm AP@50**.
+- Hiện tại 12/21 tài khoản Kaggle còn quota GPU (`131.57h` GPU khả dụng) đang chạy huấn luyện hội tụ ở `512×512` với giám sát kép **Faster R-CNN ResNet50-FPN v2 + YOLOv8s** (`--use_yolov8s`).
+
+### 5.5. Kiểm định Gate 0 (Can thiệp nhân quả, 5/5 PASS) & Đa Detector Pilot
 
 Chi tiết kiểm định can thiệp Gate 0 (`G0.1..G0.5`) lưu tại [`outputs_rigor_gate0_gate1/rigor_gate0_gate1_report.json`](./outputs_rigor_gate0_gate1/rigor_gate0_gate1_report.json) và pilot đa detector lưu tại [`outputs_rigor_gate0_gate1/cross_backbone_bdbr.json`](./outputs_rigor_gate0_gate1/cross_backbone_bdbr.json).
 
