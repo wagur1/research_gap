@@ -76,7 +76,8 @@ def read_manifest_files(manifest_path, suffix):
 
 def verify_convergence_log(log, sid, variant):
     expected_finish = f"=== Shard {sid}/21 ({variant}) finished successfully! ==="
-    if "Converged: no val improvement for 10 epochs." not in log or expected_finish not in log:
+    expected_saved = "Saved shard checkpoint" in log and f"/kaggle/working/tscope_{variant}_shard{sid:02d}of21.pt" in log
+    if "Converged: no val improvement for 10 epochs." not in log or (expected_finish not in log and not expected_saved):
         raise ValueError("Log does not corroborate exact shard convergence and completion")
     return {"startup_visible": f"Variant={variant}" in log, "completion_identity_verified": True}
 

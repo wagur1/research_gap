@@ -713,10 +713,236 @@ def run_poc_wishlist2_and_eval_shard(args: argparse.Namespace) -> None:
     print(f"[Eval Shard {args.shard_id}/{args.num_shards}] Wrote {len(shard_records)} records -> {json_path}")
 
 
+@torch.no_grad()
+def run_eval_all_variants_shards(args: argparse.Namespace) -> None:
+    """
+    Evaluates all 5 validated variant soups across one or more shard_ids in a single session,
+    caching variant-invariant methods (anchor_x265, deterministic_blur_ema, spatial_scope_framewise,
+    and shared oracle configurations) per clip/CRF while writing the exact per-(shard_id, variant)
+    JSON schema required by merge_eval_jsons_and_print_table.
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    soup_dir = Path(args.soup_dir)
+    spatial_ckpt = soup_dir / "tscope_soup_spatial_only_scope.pt"
+    if not spatial_ckpt.is_file():
+        raise FileNotFoundError(f"Missing spatial soup checkpoint: {spatial_ckpt}")
+    spatial_sha256 = sha256_file(spatial_ckpt)
+
+    models: Dict[str, TemporalSCOPE] = {}
+    ckpt_hashes: Dict[str, str] = {}
+    soup_validations: Dict[str, Any] = {}
+    for variant in VARIANTS:
+        v_path = soup_dir / f"tscope_soup_{variant}.pt"
+        if not v_path.is_file():
+            raise FileNotFoundError(f"Missing validated soup checkpoint: {v_path}")
+        ckpt_hashes[variant] = sha256_file(v_path)
+        ckpt = torch.load(v_path, map_location=device, weights_only=True)
+        validate_soup_provenance(ckpt, variant, require_validation=True)
+        soup_validations[variant] = ckpt["validation"]
+        m = TemporalSCOPE(
+            base_ch=48,
+            num_families=4,
+            cond_dim=64,
+            qg_size=16,
+            max_delta_qp=ABLATION_PRESETS[variant]["max_delta_qp"],
+        ).to(device)
+        m.load_state_dict(ckpt["state_dict"], strict=True)
+        m.eval()
+        models[variant] = m
+
+    codec = HybridX265STE(use_real_x265_in_forward=True).to(device)
+    fpn_teacher = FrozenFPNDetectorTeacher(
+        pretrained=args.use_pretrained_fpn,
+        use_yolov8s=getattr(args, "use_yolov8s", False),
+    ).to(device)
+    if not fpn_teacher.use_torchvision or fpn_teacher.detector is None:
+        raise RuntimeError("Final AP requires actual pretrained Faster R-CNN weights; detector fallback is forbidden")
+
+    shard_ids = args.shard_ids if getattr(args, "shard_ids", None) else [args.shard_id]
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    for sid in shard_ids:
+        dataset = build_sharded_dataset(args, is_train=False, default_virtual_mult=5, shard_id=sid, num_shards=args.num_shards)
+        if not isinstance(dataset, RealVCMVideoDataset) or not args.use_pretrained_fpn or not getattr(args, "disjoint_split", True):
+            raise RuntimeError("Final evaluation requires real held-out MOT17 data, disjoint splits, and pretrained Faster R-CNN")
+        expected_frame_ids = dataset.physical_frame_manifest()
+        if expected_frame_ids != EXPECTED_TEST_FRAME_IDS or args.clip_len != 4 or args.img_size not in (256, 512):
+            raise RuntimeError("Final evaluation requires all 1,648 complete-clip MOT17 test frames at the 4-frame protocol")
+
+        records_by_variant: Dict[str, List[Dict[str, Any]]] = {v: [] for v in VARIANTS}
+        t_shard = time.perf_counter()
+        for idx in range(len(dataset)):
+            sample = dataset[idx]
+            video = sample["video"].unsqueeze(0).to(device)
+            m_det = sample["m_det"].unsqueeze(0).to(device)
+            clip_id = int(sample["clip_id"].item())
+            b, t, _, h, w = video.shape
+            gt_boxes = sample["gt_boxes"].unsqueeze(0).to(device) if "gt_boxes" in sample else None
+            ignore_boxes = sample["ignore_boxes"].unsqueeze(0).to(device) if "ignore_boxes" in sample else None
+
+            blur_v = gaussian_blur_5x5(
+                gaussian_blur_5x5(gaussian_blur_5x5(video.view(b * t, 3, h, w)))
+            ).view(b, t, 3, h, w)
+            dx = torch.nn.functional.pad((video[..., :, 1:] - video[..., :, :-1]).abs(), (0, 1, 0, 0))
+            dy = torch.nn.functional.pad((video[..., 1:, :] - video[..., :-1, :]).abs(), (0, 0, 0, 1))
+            edge_gate = torch.clamp((dx + dy).mean(dim=2, keepdim=True) * 6.0, 0.0, 1.0)
+            ema_frames = []
+            bg_prev = None
+            for step_t in range(t):
+                v_t = video[:, step_t]
+                b_t = blur_v[:, step_t]
+                if step_t > 0 and bg_prev is not None:
+                    diff_mag = (v_t - video[:, step_t - 1]).abs().mean(dim=1, keepdim=True)
+                    static_w = 0.85 * torch.exp(-15.0 * diff_mag)
+                    b_t = static_w * bg_prev + (1.0 - static_w) * b_t
+                bg_prev = b_t
+                e_t = edge_gate[:, step_t]
+                ema_frames.append(e_t * v_t + (1.0 - e_t) * b_t)
+            v_det_ema = torch.stack(ema_frames, dim=1)
+            v_oracle = m_det * video + (1.0 - m_det) * blur_v[:, 0:1].expand_as(blur_v)
+
+            def evaluate_encoded(c_out: Dict[str, Any]) -> Dict[str, Any]:
+                recon = c_out["video_recon"]
+                acc = fpn_teacher.evaluate_task_accuracy(
+                    video, recon, m_det, gt_boxes=gt_boxes, ignore_boxes=ignore_boxes,
+                    require_real_detector=True, return_raw_detections=True,
+                )
+                raw_keys = ["gt_boxes", "ignore_boxes", "pred_boxes", "pred_scores"]
+                if "yolo_pred_boxes" in acc["raw_detections"]:
+                    raw_keys.extend(["yolo_pred_boxes", "yolo_pred_scores"])
+                return {
+                    "packet_sizes": c_out["packet_sizes"],
+                    "frame_types": c_out["frame_types"],
+                    "raw_detections": {k: [v.tolist() for v in acc["raw_detections"][k]] for k in raw_keys},
+                    "total_bpp": round(float(c_out["total_bpp"]), 5),
+                    "i_frame_bpp": round(float(c_out["i_frame_bpp"]), 5),
+                    "p_frame_bpp": round(float(c_out["p_frame_bpp"]), 5),
+                    "gt_ap50_pct": acc["gt_ap50_pct"],
+                    "gt_ap50_95_pct": acc["gt_ap50_95_pct"],
+                    "yolo_gt_ap50_pct": acc.get("yolo_gt_ap50_pct"),
+                    "yolo_gt_ap50_95_pct": acc.get("yolo_gt_ap50_95_pct"),
+                    "teacher_ap50_pct": acc["teacher_ap50_pct"],
+                    "map50_pct": acc["map50_pct"],
+                    "map50_95_pct": acc["map50_95_pct"],
+                    "task_roi_psnr_db": acc["task_roi_psnr_db"],
+                    "fpn_cos_sim_pct": acc["fpn_cos_sim_pct"],
+                }
+
+            for qp in CRFS:
+                sev = torch.tensor([(qp - 22.0) / 25.0], device=device, dtype=torch.float32)
+                fam = torch.tensor([0], device=device, dtype=torch.long)
+
+                base_eval = evaluate_encoded(codec.evaluate_real_x265(video, qp, None))
+                det_ema_eval = evaluate_encoded(codec.evaluate_real_x265(v_det_ema, qp, None))
+
+                pred_spatial = models["spatial_only_scope"](video, fam, sev, reuse_iframe_qp=False, disable_temporal=True)
+                spatial_eval = evaluate_encoded(codec.evaluate_real_x265(pred_spatial["i_edit"], qp, None))
+
+                oracle_qp_4_noreuse = models["full_tscope"].compute_ctu_qp_offsets(m_det, reuse_iframe_across_gop=False)
+                oracle_eval_4_noreuse = evaluate_encoded(codec.evaluate_real_x265(v_oracle, qp, oracle_qp_4_noreuse))
+
+                oracle_qp_4_reuse = models["iwa_gop_qp_reuse"].compute_ctu_qp_offsets(m_det, reuse_iframe_across_gop=True)
+                oracle_eval_4_reuse = evaluate_encoded(codec.evaluate_real_x265(v_oracle, qp, oracle_qp_4_reuse))
+
+                oracle_qp_0 = models["wo_ctu_delta_qp"].compute_ctu_qp_offsets(m_det, reuse_iframe_across_gop=False)
+                oracle_eval_0 = evaluate_encoded(codec.evaluate_real_x265(v_oracle, qp, oracle_qp_0))
+
+                tscope_evals: Dict[str, Dict[str, Any]] = {"spatial_only_scope": spatial_eval}
+                for variant in ("full_tscope", "wo_ctu_delta_qp", "iwa_gop_qp_reuse", "proxy_only_zhao"):
+                    p_cfg = ABLATION_PRESETS[variant]
+                    pred_v = models[variant](video, fam, sev, reuse_iframe_qp=p_cfg["reuse_iframe_qp"], disable_temporal=False)
+                    v_qp = pred_v["ctu_qp_offsets"] if p_cfg["max_delta_qp"] > 0 else None
+                    tscope_evals[variant] = evaluate_encoded(codec.evaluate_real_x265(pred_v["i_edit"], qp, v_qp))
+
+                for variant in VARIANTS:
+                    if variant == "full_tscope":
+                        oracle_ev = oracle_eval_4_noreuse
+                    elif variant == "iwa_gop_qp_reuse":
+                        oracle_ev = oracle_eval_4_reuse
+                    else:
+                        oracle_ev = oracle_eval_0
+
+                    for method_name, m_ev in [
+                        ("anchor_x265", base_eval),
+                        ("deterministic_blur_ema", det_ema_eval),
+                        ("spatial_scope_framewise", spatial_eval),
+                        ("tscope_temporal_ctu_qp", tscope_evals[variant]),
+                        ("oracle_gt_mask_upper_bound", oracle_ev),
+                    ]:
+                        rec = {
+                            "shard_id": sid,
+                            "variant": variant,
+                            "dataset": "MOT17_real",
+                            "clip_id": clip_id,
+                            "qp": qp,
+                            "crf": qp,
+                            "frame_ids": sample["frame_ids"],
+                            "packet_sizes": m_ev["packet_sizes"],
+                            "frame_types": m_ev["frame_types"],
+                            "height": h,
+                            "width": w,
+                            "raw_detections": m_ev["raw_detections"],
+                            "method": method_name,
+                            "total_bpp": m_ev["total_bpp"],
+                            "i_frame_bpp": m_ev["i_frame_bpp"],
+                            "p_frame_bpp": m_ev["p_frame_bpp"],
+                            "gt_ap50_pct": m_ev["gt_ap50_pct"],
+                            "gt_ap50_95_pct": m_ev["gt_ap50_95_pct"],
+                            "yolo_gt_ap50_pct": m_ev["yolo_gt_ap50_pct"],
+                            "yolo_gt_ap50_95_pct": m_ev["yolo_gt_ap50_95_pct"],
+                            "teacher_ap50_pct": m_ev["teacher_ap50_pct"],
+                            "map50_pct": m_ev["map50_pct"],
+                            "map50_95_pct": m_ev["map50_95_pct"],
+                            "task_roi_psnr_db": m_ev["task_roi_psnr_db"],
+                            "fpn_cos_sim_pct": m_ev["fpn_cos_sim_pct"],
+                        }
+                        for k_rec, v_rec in rec.items():
+                            if isinstance(v_rec, float) and not np.isfinite(v_rec):
+                                rec[k_rec] = None
+                        records_by_variant[variant].append(rec)
+
+        for variant in VARIANTS:
+            metadata = {
+                "shard_id": sid,
+                "num_shards": args.num_shards,
+                "variant": variant,
+                "checkpoint_sha256": ckpt_hashes[variant],
+                "spatial_checkpoint_sha256": spatial_sha256,
+                "crfs": CRFS,
+                "dataset": "MOT17",
+                "split": "test",
+                "expected_frame_ids": expected_frame_ids,
+                "excluded_tail_frame_ids": EXCLUDED_TEST_TAIL_FRAME_IDS,
+                "detector": {
+                    "name": "fasterrcnn_resnet50_fpn_v2",
+                    "pretrained": True,
+                    "weights": "FasterRCNN_ResNet50_FPN_V2_Weights.DEFAULT",
+                    "yolov8s": bool(fpn_teacher.use_yolov8s),
+                },
+                "codec": CODEC_CONFIGURATION,
+                "metric_policy": METRIC_POLICY,
+                "preprocessing": {
+                    "resize": "bilinear_square",
+                    "img_size": args.img_size,
+                    "clip_len": args.clip_len,
+                    "stride": args.clip_len,
+                    "tail_policy": "complete_nonoverlapping_clips_only",
+                },
+                "soup_validation": soup_validations[variant],
+            }
+            json_path = out_dir / f"eval_shard_{sid:02d}of{args.num_shards:02d}_{variant}.json"
+            with open(json_path, "x", encoding="utf-8") as f:
+                json.dump({"schema_version": 2, "metadata": metadata, "records": records_by_variant[variant]}, f, indent=2, allow_nan=False)
+        print(f"[Eval All Variants Shard {sid:02d}/{args.num_shards}] Wrote 5 variant JSONs in {time.perf_counter() - t_shard:.1f}s", flush=True)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Kaggle 20-Account Sharded Runner for T-SCOPE VCM")
-    parser.add_argument("--mode", choices=["train", "eval_poc"], default="eval_poc")
+    parser.add_argument("--mode", choices=["train", "eval_poc", "eval_all_variants"], default="eval_poc")
     parser.add_argument("--shard_id", type=int, default=0, help="Account index: 0 .. num_shards-1")
+    parser.add_argument("--shard_ids", type=int, nargs="+", default=None, help="Multiple shard indices for eval_all_variants")
+    parser.add_argument("--soup_dir", type=str, default="./release_ckpts", help="Directory containing validated soup checkpoints")
     parser.add_argument("--num_shards", type=int, default=20, help="Total Kaggle accounts")
     parser.add_argument("--variant", choices=list(ABLATION_PRESETS.keys()), default="full_tscope")
     parser.add_argument("--data_root", type=str, default="", help="Path to video dataset on Kaggle")
@@ -743,6 +969,8 @@ def main() -> None:
 
     if args.mode == "train":
         run_train_shard(args)
+    elif args.mode == "eval_all_variants":
+        run_eval_all_variants_shards(args)
     else:
         run_poc_wishlist2_and_eval_shard(args)
 
