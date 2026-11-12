@@ -2,6 +2,7 @@ import json
 import math
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -293,10 +294,11 @@ class HybridX265STE(nn.Module):
             raw_out = Path(tmpdir) / "out.rgb"
             frames_np.tofile(str(raw_in))
 
-            # If the filtergraph string exceeds 8,000 chars (e.g., dense 16x16 per-frame ROIs on Windows
-            # where CreateProcess caps command lines at 32,767 chars), pass it via a temporary file (`-/vf <path>`).
+            # If the filtergraph string exceeds 8,000 chars on Windows
+            # (where CreateProcess caps command lines at 32,767 chars), pass it via temporary file (`-/vf <path>`).
+            # On Linux (POSIX), sysconf(_SC_ARG_MAX) allows up to 2MB, so pass directly to prevent option errors on older ffmpeg.
             vf_cli_args = vf_args
-            if len(vf_args) == 2 and vf_args[0] == "-vf" and len(vf_args[1]) > 8000:
+            if sys.platform == "win32" and len(vf_args) == 2 and vf_args[0] == "-vf" and len(vf_args[1]) > 8000:
                 vf_script = Path(tmpdir) / "vf_script.txt"
                 vf_script.write_text(vf_args[1], encoding="utf-8")
                 vf_cli_args = ["-/vf", str(vf_script)]
