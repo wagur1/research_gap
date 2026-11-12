@@ -4,7 +4,9 @@ __pycache__/
 .venv/
 venv/
 outputs/
-outputs_kaggle_pool/
+outputs_kaggle_pool/*
+!outputs_kaggle_pool/merged_benchmarks.json
+!outputs_kaggle_pool/complexity_fps_report.json
 outputs_kaggle_pool_full/
 outputs_kaggle_pool_poc/
 outputs_kaggle_disjoint/*.log

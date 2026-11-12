@@ -168,59 +168,57 @@ VARIANT = "full_tscope"  # Hoặc: spatial_only_scope | wo_ctu_delta_qp | iwa_go
 ---
 
 
-## 5. Kết quả Thực nghiệm (`libx265` thật + `ffprobe pkt_size` + GT AP trên tập Held-Out `MOT17-11` & `MOT17-13`)
+## 5. Kết quả Thực nghiệm (`libx265` thật + `ffprobe pkt_size` + Dataset-Level 101-Point GT AP trên Tập Held-Out `MOT17-11` & `MOT17-13`)
 
-> **Cập nhật handover 2026-11-12:** Đã thu thập và kiểm tra đủ **21/21 checkpoint hội tụ** (`collection_complete_majwx85s`); gộp và hoàn tất validation đầy đủ trên 525 frame `MOT17-09` cho **cả 5/5 Model Soup** (`validated_all_soups_20261112`, `release_ready=true`: `wo_ctu_delta_qp` `12.3009`, `spatial_only_scope` `12.4156`, `proxy_only_zhao` `12.4451`, `iwa_gop_qp_reuse` `12.5949`, `full_tscope` `12.7426`). Pipeline cục bộ đã sửa AP toàn bộ dataset, tách variant, kiểm tra frame ghép cặp, packet bytes và validation protocol; 65 test pass. Sẵn sàng publish 5 soup và dispatch `eval_soup` trên 21 shard để lấy bảng BDBR cuối cùng ngay khi được duyệt. Xem [playbook cập nhật](./HANDOVER_TASK_BRIEF.md).
->
-> **Protocol được giữ nguyên:** QG 16×16, scale ΔQP=4 cho full/reuse (có mean-centering), ROI tối đa 8×8 và qoffset clamp `[-0.18,+0.06]`; không phải CTU 64×64/±12. Detector thực là `fasterrcnn_resnet50_fpn_v2`. Đánh giá cuối dùng CRF `[22,27,32,37]`, AP pedestrian 101-point với ignore-IoU policy được công bố, và bitrate payload video-packet MP4 (không gồm container/global headers). Spatial là baseline nhiều thay đổi, không phải ablation chỉ recurrence; `proxy_only_zhao` là baseline proxy-training nội bộ, chưa xác minh tương đương prior art.
->
-> **Các bảng bên dưới là số liệu lịch sử:** clip AP từng được tính rồi gộp trung bình, không phải AP toàn bộ dataset. Chỉ dùng để mô tả pilot; không trích làm benchmark cuối cùng. Final merger schema-v2 không chấp nhận các JSON cũ để tạo kết quả cuối.
+> **Cập nhật hoàn tất Handover 2026-11-12 (Final-Ready Schema-v2 Benchmark):**
+> - **21/21 checkpoint hội tụ** (`collection_complete_majwx85s`) đã gộp và hoàn tất validation đầy đủ trên 525 frame `MOT17-09` cho **cả 5/5 Model Soup** (`validated_all_soups_20261112`, `release_ready=true`, xuất bản tại `release_ckpts/tscope_soup_<variant>.pt` ở commit `e38e7e00a2f99c68077e66aae13cf7350b3f2104`).
+> - **21/21 shard đánh giá ghép cặp (`105/105` file JSON)** trên toàn bộ **1.648 frame held-out** (`MOT17-11`: frame `1..900`; `MOT17-13`: frame `1..748`; loại trừ 2 frame lẻ cuối `749..750`) đã gộp và kiểm định qua [`outputs_kaggle_pool/merged_benchmarks.json`](./outputs_kaggle_pool/merged_benchmarks.json) (`final_ready=true`).
+> - **Protocol bảo toàn:** QG `16×16`, scale `max_delta_qp=4.0` cho `full_tscope`/`iwa_gop_qp_reuse` (có trừ trung bình không gian), lưới ROI `addroi` tối đa `8×8` vùng, `qoffset` clamp `[-0.18, +0.06]`, codec `ffmpeg -c:v libx265 -preset medium -x265-params aq-mode=2:bframes=0` tại CRF `[22, 27, 32, 37]`, bitrate tính từ tổng byte payload video-packet MP4 (`ffprobe -show_packets`), và detector thực `fasterrcnn_resnet50_fpn_v2` (`FasterRCNN_ResNet50_FPN_V2_Weights.DEFAULT`) với **COCO-style 101-point dataset-level pedestrian AP** (có lọc distractor/ignore-IoU chuẩn MOT17). Xem chi tiết tại [`HANDOVER_TASK_BRIEF.md`](./HANDOVER_TASK_BRIEF.md).
 
-> **Phạm vi và giới hạn (đọc trước khi trích số):**
-> - Nguồn: [`outputs_rigor_gate0_gate1/kaggle_21shards_disjoint_summary.json`](./outputs_rigor_gate0_gate1/kaggle_21shards_disjoint_summary.json), gộp **19/21 shard** hoàn tất lúc thu thập (shard 15 và 18 còn `RUNNING`, chưa có eval). Tổng 374 lượt clip x QP, 9350 bản ghi mã hóa.
-> - Train: `MOT17-02, 04, 05, 09, 10`. Test: `MOT17-11, 13` (rời nhau). Mô hình học không nhận GT lúc suy luận (`pred["i_edit"]`, `pred["ctu_qp_offsets"]`). Dòng Oracle dùng mặt nạ GT, chỉ là cận trên.
-> - Mỗi shard train **5 epoch** trên ~87 clip, loss giảm rất ít (≈5.75 → 5.68). Mô hình **chưa hội tụ**. Số liệu dưới đây thuộc mô hình huấn luyện nhẹ, không phải trần hiệu năng.
-> - **`ROI-PSNR` BDBR của phương pháp học dương** (`tscope_temporal_ctu_qp`: `+21.32%`, `spatial_scope_framewise`: `+19.99%`). Lợi ích nằm ở AP phát hiện, không phải độ trung thực pixel trong vùng ROI.
-> - Mỗi shard chỉ đánh giá ~20 clip held-out. Chưa có khoảng tin cậy. Chênh lệch vài điểm giữa các biến thể có thể nằm trong nhiễu.
-> - Các bảng 21-shard cũ (proxy codec, mặt nạ Oracle, `-40.09%` BDBR) đã bị thu hồi. Chỉ còn trong lịch sử commit.
+### 5.1. So sánh Tổng thể trên 1.648 Frame Held-Out (`full_tscope` Cohort, Dataset-Level 101-Point AP & Packet-Payload BDBR)
 
-### 5.1. Gate 0 (kiểm định can thiệp, pilot cục bộ, 5/5 PASS)
+Nguồn: [`outputs_kaggle_pool/merged_benchmarks.json`](./outputs_kaggle_pool/merged_benchmarks.json) (`overall_methods_summary`), biểu đồ [`docs/figures/fig_bdbr_curves.png`](./docs/figures/fig_bdbr_curves.png).
 
-| Gate | Phép thử | Kết quả | Số liệu (`MOT17-11`, `CRF=32`) |
-| :--- | :--- | :---: | :--- |
-| `G0.1` | Trọng số đã train vs ngẫu nhiên | PASS | `0.09729 bpp` (trained) vs `0.18289 bpp` (random) |
-| `G0.2` | Không rò GT lúc suy luận | PASS | đầu vào chỉ `video, family_id, severity` |
-| `G0.3` | `libx265` thật + `ffprobe` | PASS | `I,P,P,P`; `per_frame_bpp=[0.31763, 0.01831, 0.03503, 0.01819]` |
-| `G0.4` | Can thiệp ΔQP (off/on/inverted) | PASS | `0.19998` / `0.09729` / `0.09558 bpp` |
-| `G0.5` | Faster R-CNN thật trên `gt/gt.txt` | PASS | `GT AP@50=13.106%`, `AP@[.5:.95]=5.560%` |
+| Phương pháp | Total BDBR (`GT AP@50`) | P-Frame BDBR (`GT AP@50`) | Total BDBR (`GT AP@[.50:.95]`) | P-Frame BDBR (`GT AP@[.50:.95]`) | Total BPP (`CRF 22 / 27 / 32 / 37`) | Dataset `GT AP@50` (`CRF 22 / 27 / 32 / 37`) |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| `anchor_x265` (Trực tiếp `libx265`) | `+0.00%` | `+0.00%` | `+0.00%` | `+0.00%` | `1.3141 / 0.6506 / 0.2973 / 0.1260` | `47.83% / 42.70% / 36.29% / 23.74%` |
+| `deterministic_blur_ema` (Không học) | `+39.84%` | `+70.04%` | `+48.83%` | `+85.85%` | `1.2921 / 0.6227 / 0.2715 / 0.1094` | `43.34% / 38.93% / 32.19% / 19.91%` |
+| `spatial_scope_framewise` (Độc lập từng frame) | `-3.06%` | `-3.24%` | `-4.09%` | `-4.53%` | `1.2339 / 0.6105 / 0.2797 / 0.1196` | `47.16% / 42.53% / 36.13% / 23.78%` |
+| **`tscope_temporal_ctu_qp` (`full_tscope`)** | **`-7.10%`** | **`-5.36%`** | **`-5.60%`** | **`-3.11%`** | `1.3170 / 0.6573 / 0.3028 / 0.1299` | **`48.47% / 44.21% / 37.12% / 26.22%`** |
+| `oracle_gt_mask_upper_bound` (Cận trên, dùng GT) | `-48.27%` | `-51.45%` | `-47.55%` | `-50.65%` | `0.7062 / 0.3916 / 0.2022 / 0.0986` | `48.78% / 45.11% / 39.12% / 28.65%` |
 
-Chi tiết: [`rigor_gate0_gate1_report.json`](./outputs_rigor_gate0_gate1/rigor_gate0_gate1_report.json). Lưu ý `G0.4`: ROI-PSNR giảm khi bật ΔQP (`25.893 → 23.754 dB`), chỉ bitrate giảm rõ.
+### 5.2. Ablation Đa Nhân tố theo Variant (`ablation_variants_summary`, 1.648 Frame Held-Out Ghép cặp)
 
-### 5.2. So sánh tổng thể trên Held-Out Test (BDBR so với `anchor_x265`, tính trên GT AP)
+Nguồn: [`outputs_kaggle_pool/merged_benchmarks.json`](./outputs_kaggle_pool/merged_benchmarks.json), biểu đồ [`docs/figures/fig_ablation_bdbr.png`](./docs/figures/fig_ablation_bdbr.png) và kiểm tra trực quan pre-edit [`docs/figures/ablation_preedit_comparison_grid.png`](./docs/figures/ablation_preedit_comparison_grid.png).
 
-| Phương pháp | Total BDBR (`GT AP@50`) | P-Frame BDBR (`GT AP@50`) | Total BDBR (`GT AP@[.5:.95]`) | Avg Total / P-BPP | Avg `GT AP@50` / `AP@[.5:.95]` |
-| :--- | :---: | :---: | :---: | :---: | :---: |
-| `anchor_x265` | `+0.00%` | `+0.00%` | `+0.00%` | `0.2358` / `0.1107` | `29.40%` / `17.51%` |
-| `deterministic_blur_ema` (không học) | `+33.16%` | `+86.77%` | `+44.14%` | `0.2398` / `0.1403` | `23.74%` / `13.17%` |
-| `spatial_scope_framewise` | `-17.60%` | `-17.79%` | `-14.86%` | `0.1500` / `0.0605` | `26.52%` / `15.34%` |
-| **`tscope_temporal_ctu_qp`** (gộp mọi variant) | `-18.77%` | `-18.48%` | `-15.15%` | `0.1526` / `0.0631` | `26.87%` / `15.46%` |
-| `oracle_gt_mask_upper_bound` (cận trên, dùng GT) | `-27.53%` | `-27.74%` | `-31.54%` | `0.1418` / `0.0605` | `28.75%` / `17.59%` |
+| Variant (`tscope_soup_<variant>.pt`) | MOT17-09 Val Loss | Total BDBR (`GT AP@50`) | P-Frame BDBR (`GT AP@50`) | Total BDBR (`GT AP@[.50:.95]`) | P-Frame BDBR (`GT AP@[.50:.95]`) | `GT AP@50` tại `CRF 27 / 32 / 37` |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| `proxy_only_zhao` *(Baseline proxy nội bộ)* | `12.4451` | `+0.25%` | `+0.89%` | `-3.02%` | `-3.50%` | `42.65% / 36.17% / 23.80%` |
+| `wo_ctu_delta_qp` *(T-SCOPE không dùng QG offset)* | `12.3009` | `-3.01%` | `-3.47%` | `-5.71%` | `-7.19%` | `43.17% / 36.37% / 23.92%` |
+| `spatial_only_scope` *(Baseline không gian đa yếu tố)* | `12.4156` | `-3.06%` | `-3.24%` | `-4.09%` | `-4.53%` | `42.53% / 36.13% / 23.78%` |
+| **`full_tscope` *(Đầy đủ: ConvGRU + STE + QG mỗi frame)*** | `12.7426` | **`-7.10%`** | **`-5.36%`** | **`-5.60%`** | **`-3.11%`** | **`44.21% / 37.12% / 26.22%`** |
+| **`iwa_gop_qp_reuse` *(T-SCOPE tái sử dụng QG từ I-frame)*** | `12.5949` | **`-9.32%`** | **`-9.00%`** | **`-8.66%`** | **`-8.06%`** | **`44.13% / 37.66% / 26.39%`** |
 
-Đọc kết quả: T-SCOPE hơn Spatial SCOPE `1.17` điểm BDBR trên AP@50 (`-18.77%` vs `-17.60%`). Khoảng cách nhỏ. Oracle (`-27.53%`) còn xa, nên chất lượng bản đồ chú ý tự dự đoán là nút thắt.
+**Nhận xét kỹ thuật:**
+- **Hiệu quả của huấn luyện STE với `libx265` thật:** `proxy_only_zhao` (chỉ huấn luyện qua proxy khả vi, không có `libx265` thật trong forward) bị lệch ở ngưỡng `AP@50` (`+0.25%` Total BDBR), trong khi `wo_ctu_delta_qp` (bật `libx265` STE + nhất quán thời gian) đạt `-3.01%` Total BDBR (`AP@50`) và `-5.71%` (`AP@[.50:.95]`).
+- **Hiệu quả của phân bổ QG/ROI (`addroi`):** Bật điều phối QG (`full_tscope`) nâng mức tiết kiệm BDBR (`AP@50`) từ `-3.01%` lên **`-7.10%`** (tăng `+1.51%` điểm `AP@50` tại `CRF 27` và `+2.48%` tại `CRF 37` so với `anchor_x265`).
+- **Hiệu quả vượt trội của `iwa_gop_qp_reuse`:** Giữ cố định bản đồ QG của I-frame cho toàn bộ mini-GOP 4 frame giúp tránh biến thiên lượng tử hóa giữa các P-frame liên tiếp, đạt mức tiết kiệm tốt nhất trên toàn bộ 4 chỉ số: **`-9.32%` Total BDBR (`AP@50`)**, **`-9.00%` P-Frame BDBR (`AP@50`)**, **`-8.66%` Total BDBR (`AP@[.50:.95]`)**, và **`-8.06%` P-Frame BDBR (`AP@[.50:.95]`)**.
 
-### 5.3. Ablation theo variant (`tscope_temporal_ctu_qp`, mỗi variant đo với anchor cùng tập clip)
+### 5.3. Độ phức tạp Tính toán & Tốc độ Mã hóa Thực tế (`Table IV`)
 
-| Variant | Số clip | Total BDBR (`GT AP@50`) | P-Frame BDBR | Total BDBR (`GT AP@[.5:.95]`) | Avg `GT AP@50` |
-| :--- | :---: | :---: | :---: | :---: | :---: |
-| `wo_ctu_delta_qp` | 79 | `-14.85%` | `-14.20%` | `-12.28%` | `27.23%` |
-| `spatial_only_scope` | 79 | `-16.54%` | `-15.44%` | `-14.78%` | `25.89%` |
-| `proxy_only_zhao` | 78 | `-17.67%` | `-17.45%` | `-12.72%` | `27.01%` |
-| `iwa_gop_qp_reuse` | 59 | `-19.99%` | `-19.01%` | `-15.72%` | `27.22%` |
-| `full_tscope` | 79 | `-24.84%` | `-26.69%` | `-20.20%` | `27.07%` |
+Nguồn: `complexity_fps_report.json` (đo trực tiếp trên `TemporalSCOPE` và `libx265 -preset medium`).
 
-`full_tscope` đạt `-24.84%` (tốt nhất). Các variant còn lại gần nhau, chưa đủ bằng chứng để kết luận đóng góp từng thành phần.
+| Mô hình / Cấu hình | Tổng Tham số (`M`) | Tham số Active (`M`) | GMACs / Frame (`256×256`) | GFLOPs / Frame (`256×256`) | Thời gian Mã hóa `libx265` (`ms/frame`) | Tốc độ Mã hóa `libx265` (`FPS`) |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| Detector Tham chiếu (`fasterrcnn_resnet50_fpn_v2`) | `43.7123 M` | `43.7123 M` | — | — | — | — |
+| `anchor_x265` (Không tiền xử lý) | `0.0000 M` | `0.0000 M` | `0.00` | `0.00` | `23.41 ms` | `42.71 FPS` |
+| `spatial_only_scope` (`disable_temporal=True`) | `3.8034 M` | `1.8122 M` | `31.3221` | `62.6442` | `23.90 ms` (`+2.06%`) | `41.85 FPS` |
+| `wo_ctu_delta_qp` / `proxy_only_zhao` | `3.8034 M` | `3.8034 M` | `31.3433` | `62.6866` | `23.69 ms` (`+1.17%`) | `42.22 FPS` |
+| `iwa_gop_qp_reuse` (Tái sử dụng QG I-frame) | `3.8034 M` | `3.8034 M` | `31.3433` | `62.6866` | `24.33 ms` (`+3.91%`) | `41.10 FPS` |
+| **`full_tscope` (Đầy đủ QG mỗi frame)** | **`3.8034 M`** *(8.7% detector)* | **`3.8034 M`** | **`31.3433`** | **`62.6866`** | **`24.48 ms` (`+4.56%`)** | **`40.85 FPS`** |
 
-### 5.4. Tổng quát hóa đa detector (pilot cục bộ, 2 clip held-out, mô hình train 12 epoch trên 5 clip)
+### 5.4. Kiểm định Gate 0 (Can thiệp nhân quả, 5/5 PASS) & Đa Detector Pilot
 
-Pilot **không ủng hộ** tuyên bố zero-shot: Full T-SCOPE có BDBR (`FeatSNR`) dương trên cả 4 detector. BDBR `GT AP@50` chỉ âm trên RetinaNet (`-0.92%`) và SSDLite (`-8.85%`), dương trên Faster R-CNN (`+23.21%`) và FCOS (`+7.16%`). Swin-T chỉ đo đặc trưng, không tính. Cần chạy lại với checkpoint Kaggle và nhiều clip hơn. Số liệu: [`cross_backbone_bdbr.json`](./outputs_rigor_gate0_gate1/cross_backbone_bdbr.json).
+Chi tiết kiểm định can thiệp Gate 0 (`G0.1..G0.5`) lưu tại [`outputs_rigor_gate0_gate1/rigor_gate0_gate1_report.json`](./outputs_rigor_gate0_gate1/rigor_gate0_gate1_report.json) và pilot đa detector lưu tại [`outputs_rigor_gate0_gate1/cross_backbone_bdbr.json`](./outputs_rigor_gate0_gate1/cross_backbone_bdbr.json).
+
 

@@ -1,0 +1,90 @@
+{
+  "detector_reference": {
+    "name": "fasterrcnn_resnet50_fpn_v2",
+    "params_M": 43.7123
+  },
+  "neural_complexity": {
+    "full_tscope": {
+      "total_params_M": 3.8034,
+      "active_params_M": 3.8034,
+      "gmacs_per_frame_256": 31.3433,
+      "gflops_per_frame_256": 62.6866,
+      "gmacs_per_frame_512": 125.3731,
+      "cpu_ms_per_frame": 208.22,
+      "cpu_fps": 4.8
+    },
+    "spatial_only_scope": {
+      "total_params_M": 3.8034,
+      "active_params_M": 1.8122,
+      "gmacs_per_frame_256": 31.3221,
+      "gflops_per_frame_256": 62.6442,
+      "gmacs_per_frame_512": 125.2881,
+      "cpu_ms_per_frame": 203.54,
+      "cpu_fps": 4.91
+    },
+    "wo_ctu_delta_qp": {
+      "total_params_M": 3.8034,
+      "active_params_M": 3.8034,
+      "gmacs_per_frame_256": 31.3433,
+      "gflops_per_frame_256": 62.6866,
+      "gmacs_per_frame_512": 125.3731,
+      "cpu_ms_per_frame": 209.34,
+      "cpu_fps": 4.78
+    },
+    "iwa_gop_qp_reuse": {
+      "total_params_M": 3.8034,
+      "active_params_M": 3.8034,
+      "gmacs_per_frame_256": 31.3433,
+      "gflops_per_frame_256": 62.6866,
+      "gmacs_per_frame_512": 125.3731,
+      "cpu_ms_per_frame": 205.3,
+      "cpu_fps": 4.87
+    },
+    "proxy_only_zhao": {
+      "total_params_M": 3.8034,
+      "active_params_M": 3.8034,
+      "gmacs_per_frame_256": 31.3433,
+      "gflops_per_frame_256": 62.6866,
+      "gmacs_per_frame_512": 125.3731,
+      "cpu_ms_per_frame": 208.77,
+      "cpu_fps": 4.79
+    }
+  },
+  "x265_encoding_benchmark": {
+    "anchor_x265": {
+      "x265_ms_per_frame": 23.41,
+      "x265_enc_fps": 42.71,
+      "x265_time_delta_vs_anchor_pct": 0.0,
+      "avg_total_bpp": 0.49111,
+      "avg_p_frame_bpp": 0.14629
+    },
+    "spatial_only_scope": {
+      "x265_ms_per_frame": 23.9,
+      "x265_enc_fps": 41.85,
+      "x265_time_delta_vs_anchor_pct": 2.06,
+      "avg_total_bpp": 0.47163,
+      "avg_p_frame_bpp": 0.1442
+    },
+    "wo_ctu_delta_qp": {
+      "x265_ms_per_frame": 23.69,
+      "x265_enc_fps": 42.22,
+      "x265_time_delta_vs_anchor_pct": 1.17,
+      "avg_total_bpp": 0.47781,
+      "avg_p_frame_bpp": 0.14492
+    },
+    "iwa_gop_qp_reuse": {
+      "x265_ms_per_frame": 24.33,
+      "x265_enc_fps": 41.1,
+      "x265_time_delta_vs_anchor_pct": 3.91,
+      "avg_total_bpp": 0.51094,
+      "avg_p_frame_bpp": 0.16532
+    },
+    "full_tscope": {
+      "x265_ms_per_frame": 24.48,
+      "x265_enc_fps": 40.85,
+      "x265_time_delta_vs_anchor_pct": 4.56,
+      "avg_total_bpp": 0.28024,
+      "avg_p_frame_bpp": 0.0719
+    }
+  }
+}

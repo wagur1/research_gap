@@ -4,20 +4,26 @@
 
 **Updated:** 2026-11-12
 
-**Status:** All 21 training shards and all 5 variant Model Soups are collected and validated on complete MOT17-09. Ready for publication and paired `eval_soup` dispatch upon approval.
+**Status:** COMPLETE — All 21 training shards, all 5 validated Model Soups (`release_ready=true`), all 21 paired `eval_soup` shards (`105/105` JSON outputs across 1,648 held-out test frames on `MOT17-11, 13`), `merged_benchmarks.json`, publication figures (`fig_bdbr_curves`, `fig_ablation_bdbr`, `ablation_preedit_comparison_grid`), and complexity/FPS measurements are completed and verified.
 **Decision:** Preserve the running experiment. Do not silently substitute the original brief's proposed 64×64 CTU / ±12 settings.
 
-## 1. Verified state and remaining gates
+## 1. Verified state and final benchmark results
 
-The 2026-11-12 consolidated collection verified **all 21 completed shards (21/21)** and **all 5 validated Model Soups (5/5)**:
+The 2026-11-12 consolidated collection verified **all 21 completed shards (21/21)**, **all 5 validated Model Soups (5/5)**, and **all 105 shard-variant evaluation bundles (21 shards × 5 variants = 105/105)** across the complete 1,648-frame held-out test protocol (`MOT17-11` frames `1..900`, `MOT17-13` frames `1..748`):
 
-| Variant | Validated constituents | Expected constituents | Validated Soup MOT17-09 Loss | Constituent best losses |
-|---|---|---|---|---|
-| `full_tscope` | 00, 05, 10, 15, 20 | 00, 05, 10, 15, 20 | `12.742629` | `[11.8433, 11.7516, 12.3358, 12.0157, 13.0095]` |
-| `spatial_only_scope` | 01, 06, 11, 16 | 01, 06, 11, 16 | `12.415585` | `[12.9107, 13.2524, 12.6541, 12.5981]` |
-| `wo_ctu_delta_qp` | 02, 07, 12, 17 | 02, 07, 12, 17 | `12.300856` | `[13.1044, 12.3472, 12.0754, 11.5572]` |
-| `iwa_gop_qp_reuse` | 03, 08, 13, 18 | 03, 08, 13, 18 | `12.594893` | `[12.3554, 12.2894, 12.2246, 11.7911]` |
-| `proxy_only_zhao` | 04, 09, 14, 19 | 04, 09, 14, 19 | `12.445146` | `[13.1437, 12.2289, 11.8806, 12.3579]` |
+| Variant | Validated constituents | Validated Soup MOT17-09 Loss | Total BDBR (`GT AP@50`) | P-Frame BDBR (`GT AP@50`) | Total BDBR (`GT AP@[.50:.95]`) | P-Frame BDBR (`GT AP@[.50:.95]`) |
+|---|---|---:|---:|---:|---:|---:|
+| `full_tscope` | 00, 05, 10, 15, 20 | `12.742629` | **`-7.10%`** | **`-5.36%`** | **`-5.60%`** | **`-3.11%`** |
+| `iwa_gop_qp_reuse` | 03, 08, 13, 18 | `12.594893` | **`-9.32%`** | **`-9.00%`** | **`-8.66%`** | **`-8.06%`** |
+| `spatial_only_scope` | 01, 06, 11, 16 | `12.415585` | `-3.06%` | `-3.24%` | `-4.09%` | `-4.53%` |
+| `wo_ctu_delta_qp` | 02, 07, 12, 17 | `12.300856` | `-3.01%` | `-3.47%` | `-5.71%` | `-7.19%` |
+| `proxy_only_zhao` | 04, 09, 14, 19 | `12.445146` | `+0.25%` | `+0.89%` | `-3.02%` | `-3.50%` |
+
+- Published commit for `eval_soup`: `e38e7e00a2f99c68077e66aae13cf7350b3f2104`.
+- Consolidated 21-shard evaluation manifest: `C:\Users\Wagur1\Desktop\Paper\handover_artifacts\eval_collection_20261112\collection_manifest.json` (`105/105` JSON files).
+- Final merged benchmark: `C:\Users\Wagur1\Desktop\Paper\handover_artifacts\final_eval_summary_20261112\merged_benchmarks.json` (also copied to `outputs_kaggle_pool/merged_benchmarks.json`).
+- Final rendered figures: `C:\Users\Wagur1\Desktop\Paper\handover_artifacts\final_figures_20261112` (copied after visual verification to `docs/figures/`).
+- Complexity and FPS report: `C:\Users\Wagur1\Desktop\Paper\handover_artifacts\validated_all_soups_20261112\complexity_fps_report.json`.
 
 All twenty-one collected checkpoints passed source hashes, finite tensor checks, exact parameter keys/shapes/dtypes, strict model loading, split metadata, and early-stop history/log checks. Validation occurs every two epochs; missing `val_loss` on intervening epochs is not nonfinite validation.
 
