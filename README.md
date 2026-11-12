@@ -23,6 +23,9 @@ Các nghiên cứu hiện tại về tiền xử lý (Pre-processing / Pre-editi
 
 Từ bảng phân tích trên, chúng ta đề xuất **T-SCOPE (*Temporally-Consistent Semantic Pre-Editing and CTU-Level Rate Allocation*)** — một khung tiền xử lý video tương thích hoàn toàn với bộ mã hóa chuẩn **`libx265` (HEVC)** (với cấu trúc mở rộng sang `VVenC` / VVC trong công việc tương lai), giải quyết đồng thời cả 3 nút thắt mà không cần gắn mạng backbone nặng ở bộ mã hóa. *(Lưu ý phạm vi `R11`: Các dẫn chiếu tới Data Processing Inequality / Information Bottleneck đóng vai trò nguyên lý định hướng thiết kế hàm mất mát, và thực nghiệm kiểm chứng trong kho mã nguồn này tập trung trên bộ mã hóa thực `libx265` qua `ffmpeg` + `ffprobe` + `addroi`)*:
 
+![T-SCOPE System Overview Pipeline](docs/figures/fig_pipeline_overview.png)
+*Hình 1: Sơ đồ kiến trúc tổng quan của T-SCOPE theo tiêu chuẩn bài báo IEEE TCSVT / TIP (Vector PDF: [`docs/figures/fig_pipeline_overview.pdf`](docs/figures/fig_pipeline_overview.pdf)). Pipeline gồm 5 khối chức năng chính: (1) Nhập chuỗi video và vector điều kiện hóa nén $c_t$; (2) Mạng U-Net TemporalSCOPE điều biến FiLM với ConvGRU Bottleneck và tiền biên tập 2 nhánh; (3) Phân phối $\Delta\text{QP}$ CTU bất đối xứng qua FFmpeg `addroi` 16×16; (4) Vòng lặp nén HEVC `libx265` chuẩn với đạo hàm ngược qua STE Proxy; (5) Giám sát tác vụ đa bộ dò hạ nguồn (Faster R-CNN v2 + YOLOv8s).*
+
 ```
 Input Video {I_t} ──► [TemporalSCOPE (3.80M params, ConvGRU + FiLM)]
                              │
