@@ -25,7 +25,7 @@ from video_codecs.hybrid_x265_ste import HybridX265STE
 from losses.vcm_temporal_loss import VCMTemporalPreEditLoss
 from vcm_datasets.vcm_video_datasets import RealVCMVideoDataset
 from scripts.prepare_kaggle_datasets import find_mounted_kaggle_dataset
-from scripts.experiment_protocol import CODEC_CONFIGURATION, CRFS, METRIC_POLICY, EXPECTED_TEST_FRAME_IDS, EXCLUDED_TEST_TAIL_FRAME_IDS, sha256_file, validate_soup_provenance
+from scripts.experiment_protocol import CODEC_CONFIGURATION, CRFS, METRIC_POLICY, VARIANTS, EXPECTED_TEST_FRAME_IDS, EXCLUDED_TEST_TAIL_FRAME_IDS, sha256_file, validate_soup_provenance
 
 
 def get_shard_slice(items: List[Any], shard_id: int, num_shards: int) -> List[Any]:
