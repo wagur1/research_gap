@@ -417,6 +417,8 @@ def run_train_shard(args: argparse.Namespace) -> None:
 
             scaler.scale(loss_scaled).backward()
             if (step_idx + 1) % grad_accum_steps == 0 or (step_idx + 1) == len(loader):
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(base_model.parameters(), 1.0)
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)

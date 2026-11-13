@@ -55,21 +55,26 @@ class SeverityConditioner(nn.Module):
 
 class FiLMConvBlock(nn.Module):
     """
-    Two 3x3 Conv + GELU layers modulated by Feature-wise Linear Modulation (FiLM):
+    Two 3x3 Conv + GroupNorm + GELU layers modulated by Feature-wise Linear Modulation (FiLM):
         FiLM(x, c) = x * (1 + gamma(c)) + beta(c)
     """
 
     def __init__(self, in_ch: int, out_ch: int, cond_dim: int = 64) -> None:
         super().__init__()
+        num_groups = min(8, out_ch)
+        while num_groups > 1 and (out_ch % num_groups) != 0:
+            num_groups -= 1
         self.conv1 = nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1)
+        self.norm1 = nn.GroupNorm(num_groups, out_ch)
         self.act1 = nn.GELU()
         self.conv2 = nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1)
+        self.norm2 = nn.GroupNorm(num_groups, out_ch)
         self.act2 = nn.GELU()
         self.film_proj = nn.Linear(cond_dim, out_ch * 2)
 
     def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
-        h = self.act1(self.conv1(x))
-        h = self.conv2(h)
+        h = self.act1(self.norm1(self.conv1(x)))
+        h = self.norm2(self.conv2(h))
         gamma_beta = self.film_proj(c).unsqueeze(-1).unsqueeze(-1)
         gamma, beta = torch.chunk(gamma_beta, 2, dim=1)
         h = h * (1.0 + gamma) + beta
@@ -145,13 +150,16 @@ class TemporalSCOPE(nn.Module):
             num_families=num_families, family_emb_dim=8, cond_dim=cond_dim
         )
 
-        # Encoder: HxW -> H/2xW/2 -> H/4xW/4
+        # Encoder: HxW -> H/2xW/2 -> H/4xW/4 (+ H/8xW/8 global context branch)
         # Input channels: 3 (current frame I_t) + 3 (temporal frame diff I_t - I_{t-1}) = 6
         self.enc1 = FiLMConvBlock(6, base_ch, cond_dim)
         self.down1 = nn.Conv2d(base_ch, base_ch * 2, kernel_size=4, stride=2, padding=1)
         self.enc2 = FiLMConvBlock(base_ch * 2, base_ch * 2, cond_dim)
         self.down2 = nn.Conv2d(base_ch * 2, base_ch * 4, kernel_size=4, stride=2, padding=1)
         self.bottleneck = FiLMConvBlock(base_ch * 4, base_ch * 4, cond_dim)
+        self.down3 = nn.Conv2d(base_ch * 4, base_ch * 4, kernel_size=4, stride=2, padding=1)
+        self.enc3 = FiLMConvBlock(base_ch * 4, base_ch * 4, cond_dim)
+        self.ctx_fuse = FiLMConvBlock(base_ch * 8, base_ch * 4, cond_dim)
 
         # Recurrent Temporal Alignment at H/4 x W/4
         self.temporal_gru = TemporalConvGRUCell(base_ch * 4)
@@ -164,40 +172,43 @@ class TemporalSCOPE(nn.Module):
 
         # Output prediction heads
         self.attn_head = nn.Conv2d(base_ch, 1, kernel_size=3, padding=1)
+        self.attn_cond_bias = nn.Linear(cond_dim, 1)
         self.obj_res_head = nn.Conv2d(base_ch, 3, kernel_size=3, padding=1)
         self.bg_res_head = nn.Conv2d(base_ch, 3, kernel_size=3, padding=1)
+        self.bg_blur_strength = nn.Sequential(
+            nn.Linear(cond_dim, 16),
+            nn.GELU(),
+            nn.Linear(16, 1),
+            nn.Sigmoid(),
+        )
         # Temporal EMA gate head for static background locking across P-frames
         self.bg_temporal_gate = nn.Conv2d(base_ch, 1, kernel_size=3, padding=1)
+        nn.init.constant_(self.bg_temporal_gate.bias, 1.0)
 
     def compute_ctu_qp_offsets(
         self, attn_map: torch.Tensor, reuse_iframe_across_gop: bool = False
     ) -> torch.Tensor:
         """
         Converts pixel-level attention A_t [B, T, 1, H, W] into x265 QG/CTU-level
-        Delta-QP offsets [B, T, H//qg_size, W//qg_size].
-        Supports IWA-QP mode (inspired by IWA-RDO, ICASSP 2026) where t=0 (I-frame)
-        importance map is reused across the mini-GOP.
+        Delta-QP offsets [B, T, H//qg_size, W//qg_size] using an absolute threshold pivot
+        so sparse foreground preserves negative/neutral QP while background harvests +QP savings.
         """
         b, t, _, h, w = attn_map.shape
         attn_flat = attn_map.view(b * t, 1, h, w)
-        qg_attn = F.avg_pool2d(
+        avg_qg = F.avg_pool2d(
             attn_flat, kernel_size=self.qg_size, stride=self.qg_size
-        )  # [B*T, 1, H_qg, W_qg]
-        mean_attn = qg_attn.mean(dim=(-2, -1), keepdim=True)
-        min_attn = qg_attn.amin(dim=(-2, -1), keepdim=True)
-        max_attn = qg_attn.amax(dim=(-2, -1), keepdim=True)
+        )
+        max_qg = F.max_pool2d(
+            attn_flat, kernel_size=self.qg_size, stride=self.qg_size
+        )
+        # Foreground-sensitive pool mix prevents small pedestrians in 32x32 CTU cells from being coarsened.
+        qg_attn = 0.75 * avg_qg + 0.25 * max_qg  # [B*T, 1, H_qg, W_qg]
 
-        # Asymmetric foreground/background rate allocation:
-        #   - Foreground (qg_attn >= mean_attn): negative Delta-QP in [-max_delta_qp, 0] (up to -4.0 QP)
-        #   - Background (qg_attn < mean_attn): positive Delta-QP in [0, +1.8 * max_delta_qp] (up to +7.2 QP -> qoffset +0.14)
-        # Because pedestrian ROIs occupy only 10-20% of the frame, symmetric zero-mean normalization
-        # capped background Delta-QP at < +2.5 QP (+0.05 qoffset). Asymmetric normalization allows
-        # pure background blocks to reach +6..+8 QP (+0.12..+0.14 qoffset) for strong bitrate savings.
-        fg_denom = torch.clamp(max_attn - mean_attn, min=0.05)
-        bg_denom = torch.clamp(mean_attn - min_attn, min=0.05)
-        fg_norm = torch.clamp((qg_attn - mean_attn) / fg_denom, 0.0, 1.0)
-        bg_norm = torch.clamp((mean_attn - qg_attn) / bg_denom, 0.0, 1.0)
-        delta_qp = self.max_delta_qp * (1.8 * bg_norm - 1.0 * fg_norm)
+        tau = 0.30
+        bg_part = F.relu(tau - qg_attn) / tau
+        fg_part = F.relu(qg_attn - tau) / (1.0 - tau)
+        delta_qp = self.max_delta_qp * (1.75 * bg_part - 1.0 * fg_part)
+        delta_qp = torch.clamp(delta_qp, min=-0.18 * 51.0, max=0.14 * 51.0)
         delta_qp = delta_qp.view(b, t, delta_qp.shape[-2], delta_qp.shape[-1])
 
         if reuse_iframe_across_gop and t > 1:
@@ -219,8 +230,11 @@ class TemporalSCOPE(nn.Module):
         f1 = self.enc1(x_in, c)  # [B, C, H, W]
         f2 = self.enc2(self.down1(f1), c)  # [B, 2C, H/2, W/2]
         f3 = self.bottleneck(self.down2(f2), c)  # [B, 4C, H/4, W/4]
+        f4 = self.enc3(self.down3(f3), c)  # [B, 4C, H/8, W/8]
+        f4_up = F.interpolate(f4, size=f3.shape[-2:], mode="bilinear", align_corners=False)
+        f3_ctx = self.ctx_fuse(torch.cat([f3, f4_up], dim=1), c)  # [B, 4C, H/4, W/4]
 
-        h_curr = self.temporal_gru(f3, h_prev)  # [B, 4C, H/4, W/4]
+        h_curr = self.temporal_gru(f3_ctx, h_prev)  # [B, 4C, H/4, W/4]
 
         u2 = F.interpolate(h_curr, size=f2.shape[-2:], mode="bilinear", align_corners=False)
         u2 = self.dec2(torch.cat([self.up2(u2), f2], dim=1), c)
@@ -228,27 +242,35 @@ class TemporalSCOPE(nn.Module):
         u1 = F.interpolate(u2, size=f1.shape[-2:], mode="bilinear", align_corners=False)
         u1 = self.dec1(torch.cat([self.up1(u1), f1], dim=1), c)
 
-        attn_t = torch.sigmoid(self.attn_head(u1))  # [B, 1, H, W]
+        attn_bias = self.attn_cond_bias(c).view(-1, 1, 1, 1)
+        attn_t = torch.sigmoid(self.attn_head(u1) + attn_bias)  # [B, 1, H, W]
         delta_obj_t = self.max_obj_res * torch.tanh(self.obj_res_head(u1))
         delta_bg_t = self.max_bg_res * torch.tanh(self.bg_res_head(u1))
 
         # Object-preserving branch
         i_obj_t = torch.clamp(i_t + delta_obj_t, 0.0, 1.0)
 
-        # Temporally-anchored low-pass background branch (3-pass 5x5 Gaussian = effective 13x13 sigma=2.1)
-        blur_i_t = gaussian_blur_5x5(gaussian_blur_5x5(gaussian_blur_5x5(i_t)))
+        # Severity-conditioned low-pass background branch (5x5 -> 13x13 Gaussian blend)
+        blur_mild = gaussian_blur_5x5(i_t)
+        blur_strong = gaussian_blur_5x5(gaussian_blur_5x5(blur_mild))
+        blur_mix = self.bg_blur_strength(c).view(-1, 1, 1, 1)
+        blur_i_t = (1.0 - blur_mix) * blur_mild + blur_mix * blur_strong
         i_bg_spatial = torch.clamp(blur_i_t + delta_bg_t, 0.0, 1.0)
         if bg_prev is not None:
-            # Gate temporal EMA by motion magnitude so static backgrounds lock across frames
-            motion_mag = diff_t.abs().mean(dim=1, keepdim=True)
-            static_mask = torch.exp(-15.0 * motion_mag)
+            # Strong motion gating (exp(-30*mm)) avoids double-exposure ghosting on panning cameras
+            blur_diff_t = gaussian_blur_5x5(diff_t)
+            motion_mag = (
+                0.7 * diff_t.abs().mean(dim=1, keepdim=True)
+                + 0.3 * blur_diff_t.abs().mean(dim=1, keepdim=True)
+            )
+            static_mask = torch.exp(-30.0 * motion_mag)
             temporal_weight = 0.92 * torch.sigmoid(self.bg_temporal_gate(u1)) * static_mask
             i_bg_t = temporal_weight * bg_prev + (1.0 - temporal_weight) * i_bg_spatial
         else:
             i_bg_t = i_bg_spatial
 
-        # Soft-gated foreground preservation: boost learned attention contrast so foreground pixels stay sharp
-        eff_attn_t = torch.clamp(attn_t * 1.35, 0.0, 1.0)
+        # Direct foreground/background attention blend without deadzone saturation
+        eff_attn_t = attn_t
         i_edit_t = eff_attn_t * i_obj_t + (1.0 - eff_attn_t) * i_bg_t
         return i_edit_t, attn_t, delta_obj_t, delta_bg_t, h_curr, i_bg_t
 

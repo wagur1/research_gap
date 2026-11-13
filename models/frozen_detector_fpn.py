@@ -1,5 +1,6 @@
 import math
 from typing import Any, Dict, List, Optional, Tuple
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -145,6 +146,126 @@ class FrozenFPNDetectorTeacher(nn.Module):
         )
 
     @staticmethod
+    def _prepare_dataset_ap_cache(
+        all_gt_boxes: List[torch.Tensor],
+        all_pred_boxes: List[torch.Tensor],
+        all_pred_scores: List[torch.Tensor],
+        all_ignore_boxes: Optional[List[torch.Tensor]] = None,
+    ) -> Tuple[int, List[int], List[Optional[np.ndarray]], List[Optional[np.ndarray]], List[Tuple[int, int]]]:
+        """Validate frame tensors and precompute per-image IoU matrices and sorted prediction order."""
+        from torchvision.ops import box_iou
+
+        count = len(all_gt_boxes)
+        if len(all_pred_boxes) != count or len(all_pred_scores) != count or (all_ignore_boxes is not None and len(all_ignore_boxes) != count):
+            raise ValueError("AP requires aligned GT, prediction, score, and ignore frame lists")
+        for index in range(count):
+            boxes = [all_gt_boxes[index], all_pred_boxes[index]]
+            if all_ignore_boxes is not None:
+                boxes.append(all_ignore_boxes[index])
+            for tensor in boxes:
+                if tensor.ndim != 2 or tensor.shape[1] != 4 or not bool(torch.isfinite(tensor).all()) or bool(((tensor[:, 2:] - tensor[:, :2]) <= 0).any()):
+                    raise ValueError("AP box tensors must contain finite nondegenerate XYXY boxes")
+            scores = all_pred_scores[index]
+            if scores.ndim != 1 or scores.numel() != all_pred_boxes[index].shape[0] or not bool(torch.isfinite(scores).all()) or bool(((scores < 0) | (scores > 1)).any()):
+                raise ValueError("AP confidence scores must align with boxes and lie in [0, 1]")
+
+        total_gt = sum(int(g.shape[0]) for g in all_gt_boxes)
+        if total_gt == 0:
+            return 0, [], [], [], []
+
+        n_gts: List[int] = []
+        img_gt_ious: List[Optional[np.ndarray]] = []
+        img_ig_max_ious: List[Optional[np.ndarray]] = []
+        flat_preds: List[Tuple[float, int, int]] = []
+        for img_idx, (pb, ps) in enumerate(zip(all_pred_boxes, all_pred_scores)):
+            pb_cpu = pb.detach().cpu()
+            ps_cpu = ps.detach().cpu()
+            gb_cpu = all_gt_boxes[img_idx].detach().cpu()
+            n_gts.append(int(gb_cpu.shape[0]))
+            if pb_cpu.shape[0] > 0 and gb_cpu.shape[0] > 0:
+                img_gt_ious.append(box_iou(pb_cpu, gb_cpu).numpy())
+            else:
+                img_gt_ious.append(None)
+            if (
+                all_ignore_boxes is not None
+                and img_idx < len(all_ignore_boxes)
+                and pb_cpu.shape[0] > 0
+                and all_ignore_boxes[img_idx].shape[0] > 0
+            ):
+                ig_cpu = all_ignore_boxes[img_idx].detach().cpu()
+                img_ig_max_ious.append(box_iou(pb_cpu, ig_cpu).max(dim=1).values.numpy())
+            else:
+                img_ig_max_ious.append(None)
+            for j, sc in enumerate(ps_cpu.tolist()):
+                flat_preds.append((float(sc), img_idx, j))
+
+        flat_preds.sort(key=lambda x: x[0], reverse=True)
+        sorted_pairs = [(img_idx, pred_j) for _, img_idx, pred_j in flat_preds]
+        return total_gt, n_gts, img_gt_ious, img_ig_max_ious, sorted_pairs
+
+    @staticmethod
+    def _score_dataset_ap_at_threshold(
+        total_gt: int,
+        n_gts: List[int],
+        img_gt_ious: List[Optional[np.ndarray]],
+        img_ig_max_ious: List[Optional[np.ndarray]],
+        sorted_pairs: List[Tuple[int, int]],
+        iou_thresh: float,
+    ) -> float:
+        """Compute exact 101-point COCO AP for a single IoU threshold using precomputed IoU matrices."""
+        if total_gt == 0:
+            return float("nan")
+        if not sorted_pairs:
+            return 0.0
+
+        gt_matched = [np.zeros(n, dtype=bool) for n in n_gts]
+        neg_one = np.float32(-1.0)
+        tp_list: List[float] = []
+        fp_list: List[float] = []
+
+        for img_idx, pred_j in sorted_pairs:
+            gt_iou_mat = img_gt_ious[img_idx]
+            matched_active = False
+            if gt_iou_mat is not None:
+                m_flags = gt_matched[img_idx]
+                if not m_flags.all():
+                    masked = np.where(m_flags, neg_one, gt_iou_mat[pred_j])
+                    best_gt_idx = int(np.argmax(masked))
+                    if float(masked[best_gt_idx]) >= iou_thresh:
+                        m_flags[best_gt_idx] = True
+                        tp_list.append(1.0)
+                        fp_list.append(0.0)
+                        matched_active = True
+            if matched_active:
+                continue
+
+            ig_max = img_ig_max_ious[img_idx]
+            if ig_max is not None and float(ig_max[pred_j]) >= iou_thresh:
+                continue
+
+            tp_list.append(0.0)
+            fp_list.append(1.0)
+
+        if not tp_list:
+            return 0.0
+
+        tp = np.asarray(tp_list, dtype=np.float64)
+        fp = np.asarray(fp_list, dtype=np.float64)
+        tp_cum = np.cumsum(tp)
+        fp_cum = np.cumsum(fp)
+
+        recall = tp_cum / float(total_gt)
+        precision = tp_cum / np.maximum(tp_cum + fp_cum, 1e-9)
+        mpre = np.maximum.accumulate(precision[::-1])[::-1]
+
+        recall_grid = np.linspace(0.0, 1.0, 101, dtype=np.float64)
+        ap_vals = np.zeros_like(recall_grid)
+        inds = np.searchsorted(recall, recall_grid, side="left")
+        valid = inds < recall.shape[0]
+        ap_vals[valid] = mpre[inds[valid]]
+        return float(ap_vals.mean())
+
+    @staticmethod
     def compute_dataset_level_ap(
         all_gt_boxes: List[torch.Tensor],
         all_pred_boxes: List[torch.Tensor],
@@ -163,124 +284,17 @@ class FrozenFPNDetectorTeacher(nn.Module):
             This explicit reusable-IoU ignore policy is not full official COCO crowd/area/maxDets evaluation.
           - Integrates the precision-recall envelope over the exact 101-point COCO recall grid `[0.00, 0.01, ..., 1.00]`.
         """
-        from torchvision.ops import box_iou
-
-        count = len(all_gt_boxes)
-        if len(all_pred_boxes) != count or len(all_pred_scores) != count or (all_ignore_boxes is not None and len(all_ignore_boxes) != count):
-            raise ValueError("AP requires aligned GT, prediction, score, and ignore frame lists")
         if not math.isfinite(iou_thresh) or not 0.0 < iou_thresh <= 1.0:
             raise ValueError("Invalid AP IoU threshold")
-        for index in range(count):
-            boxes = [all_gt_boxes[index], all_pred_boxes[index]]
-            if all_ignore_boxes is not None:
-                boxes.append(all_ignore_boxes[index])
-            for tensor in boxes:
-                if tensor.ndim != 2 or tensor.shape[1] != 4 or not bool(torch.isfinite(tensor).all()) or bool(((tensor[:, 2:] - tensor[:, :2]) <= 0).any()):
-                    raise ValueError("AP box tensors must contain finite nondegenerate XYXY boxes")
-            scores = all_pred_scores[index]
-            if scores.ndim != 1 or scores.numel() != all_pred_boxes[index].shape[0] or not bool(torch.isfinite(scores).all()) or bool(((scores < 0) | (scores > 1)).any()):
-                raise ValueError("AP confidence scores must align with boxes and lie in [0, 1]")
-
-        total_gt = sum(int(g.shape[0]) for g in all_gt_boxes)
-        if total_gt == 0:
-            return float("nan")
-
-        gt_matched = [
-            torch.zeros((g.shape[0],), dtype=torch.bool) for g in all_gt_boxes
-        ]
-
-        # Precompute per-image IoU matrices once (pb_cpu vs gboxes, and pb_cpu vs ig_boxes)
-        # for 55x faster dataset-level evaluation with identical exact 101-point COCO AP results.
-        img_gt_ious: List[Optional[torch.Tensor]] = []
-        img_ig_max_ious: List[Optional[torch.Tensor]] = []
-        flat_preds: List[Tuple[float, int, int]] = []
-        for img_idx, (pb, ps) in enumerate(zip(all_pred_boxes, all_pred_scores)):
-            pb_cpu = pb.detach().cpu()
-            ps_cpu = ps.detach().cpu()
-            gb_cpu = all_gt_boxes[img_idx].detach().cpu()
-            if pb_cpu.shape[0] > 0 and gb_cpu.shape[0] > 0:
-                img_gt_ious.append(box_iou(pb_cpu, gb_cpu))
-            else:
-                img_gt_ious.append(None)
-            if (
-                all_ignore_boxes is not None
-                and img_idx < len(all_ignore_boxes)
-                and pb_cpu.shape[0] > 0
-                and all_ignore_boxes[img_idx].shape[0] > 0
-            ):
-                ig_cpu = all_ignore_boxes[img_idx].detach().cpu()
-                img_ig_max_ious.append(box_iou(pb_cpu, ig_cpu).max(dim=1).values)
-            else:
-                img_ig_max_ious.append(None)
-            for j in range(pb_cpu.shape[0]):
-                flat_preds.append((float(ps_cpu[j].item()), img_idx, j))
-
-        if not flat_preds:
-            return 0.0
-
-        # Sort globally by descending confidence score
-        flat_preds.sort(key=lambda x: x[0], reverse=True)
-
-        tp_list: List[float] = []
-        fp_list: List[float] = []
-
-        for _, img_idx, pred_j in flat_preds:
-            matched_flags = gt_matched[img_idx]
-            gt_iou_mat = img_gt_ious[img_idx]
-
-            # 1. Match against highest-IoU UNMATCHED active GT box
-            matched_active = False
-            if gt_iou_mat is not None:
-                ious = gt_iou_mat[pred_j]  # [N_gt]
-                unmatched_indices = torch.where(~matched_flags)[0]
-                if unmatched_indices.numel() > 0:
-                    unmatched_ious = ious[unmatched_indices]
-                    best_rel_idx = int(torch.argmax(unmatched_ious).item())
-                    best_iou = float(unmatched_ious[best_rel_idx].item())
-                    if best_iou >= iou_thresh:
-                        best_gt_idx = int(unmatched_indices[best_rel_idx].item())
-                        matched_flags[best_gt_idx] = True
-                        tp_list.append(1.0)
-                        fp_list.append(0.0)
-                        matched_active = True
-
-            if matched_active:
-                continue
-
-            # 2. Check MOT17 ignore/distractor boxes (neither TP nor FP if IoU >= iou_thresh)
-            ig_max = img_ig_max_ious[img_idx]
-            if ig_max is not None and float(ig_max[pred_j].item()) >= iou_thresh:
-                continue
-
-            tp_list.append(0.0)
-            fp_list.append(1.0)
-
-        if not tp_list:
-            return 0.0
-
-        tp = torch.tensor(tp_list, dtype=torch.float64)
-        fp = torch.tensor(fp_list, dtype=torch.float64)
-        tp_cum = torch.cumsum(tp, dim=0)
-        fp_cum = torch.cumsum(fp, dim=0)
-
-        recall = tp_cum / float(total_gt)
-        precision = tp_cum / torch.clamp(tp_cum + fp_cum, min=1e-9)
-
-        # Make precision monotonically non-increasing from right to left
-        mpre = precision.clone()
-        for i in range(mpre.shape[0] - 2, -1, -1):
-            if mpre[i + 1] > mpre[i]:
-                mpre[i] = mpre[i + 1]
-
-        # Official 101-point COCO recall grid interpolation: r in {0.00, 0.01, ..., 1.00}
-        recall_grid = torch.linspace(0.0, 1.0, 101, dtype=torch.float64)
-        ap_vals = torch.zeros_like(recall_grid)
-        for r_idx, r_thr in enumerate(recall_grid):
-            inds = torch.where(recall >= r_thr)[0]
-            if inds.numel() > 0:
-                ap_vals[r_idx] = mpre[inds[0]]
-
-        return float(ap_vals.mean().item())
+        total_gt, n_gts, img_gt_ious, img_ig_max_ious, sorted_pairs = FrozenFPNDetectorTeacher._prepare_dataset_ap_cache(
+            all_gt_boxes,
+            all_pred_boxes,
+            all_pred_scores,
+            all_ignore_boxes=all_ignore_boxes,
+        )
+        return FrozenFPNDetectorTeacher._score_dataset_ap_at_threshold(
+            total_gt, n_gts, img_gt_ious, img_ig_max_ious, sorted_pairs, iou_thresh
+        )
 
     @staticmethod
     def compute_dataset_level_coco_metrics(
@@ -293,14 +307,18 @@ class FrozenFPNDetectorTeacher(nn.Module):
         Computes COCO-style dataset-level `gt_ap50_pct` (IoU=0.50) and `gt_ap50_95_pct`
         (mean over IoU=0.50:0.05:0.95) across all evaluated frames.
         """
+        total_gt, n_gts, img_gt_ious, img_ig_max_ious, sorted_pairs = FrozenFPNDetectorTeacher._prepare_dataset_ap_cache(
+            all_gt_boxes,
+            all_pred_boxes,
+            all_pred_scores,
+            all_ignore_boxes=all_ignore_boxes,
+        )
+        if total_gt == 0:
+            return {"gt_ap50_pct": float("nan"), "gt_ap50_95_pct": float("nan")}
         iou_thresholds = [round(0.50 + 0.05 * i, 2) for i in range(10)]
         aps = [
-            FrozenFPNDetectorTeacher.compute_dataset_level_ap(
-                all_gt_boxes,
-                all_pred_boxes,
-                all_pred_scores,
-                all_ignore_boxes=all_ignore_boxes,
-                iou_thresh=thr,
+            FrozenFPNDetectorTeacher._score_dataset_ap_at_threshold(
+                total_gt, n_gts, img_gt_ious, img_ig_max_ious, sorted_pairs, thr
             )
             for thr in iou_thresholds
         ]

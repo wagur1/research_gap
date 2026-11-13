@@ -371,7 +371,7 @@ class RealVCMVideoDataset(Dataset):
         t, c, h, w = video.shape
         target = (self.img_size // 16) * 16
 
-        if h < target or w < target or not self.is_train:
+        if h < target or w < target or not self.is_train or torch.rand(1).item() < 0.50:
             v_out = F.interpolate(video, size=(target, target), mode="bilinear", align_corners=False)
             ma_out = F.interpolate(m_attn, size=(target, target), mode="nearest")
             md_out = F.interpolate(m_det, size=(target, target), mode="nearest")
@@ -384,24 +384,36 @@ class RealVCMVideoDataset(Dataset):
                 self._transform_boxes_list(raw_ignore_per_frame, target, sx=sx, sy=sy),
             )
 
-        # Find object center from m_attn on first frame if available
+        # Multi-scale train crop: random scale down from native resolution to align with full-frame eval sizes
+        min_scale = min(1.0, max(float(target) / float(h), float(target) / float(w), 0.45))
+        scale = min_scale + (1.0 - min_scale) * float(torch.rand(1).item())
+        rh = max(target, int(round(h * scale)))
+        rw = max(target, int(round(w * scale)))
+        if (rh, rw) != (h, w):
+            video = F.interpolate(video, size=(rh, rw), mode="bilinear", align_corners=False)
+            m_attn = F.interpolate(m_attn, size=(rh, rw), mode="nearest")
+            m_det = F.interpolate(m_det, size=(rh, rw), mode="nearest")
+        sx, sy = float(rw) / float(w), float(rh) / float(h)
+
+        # Find object center from m_attn on first frame if available (+ mild jitter)
         ys, xs = torch.where(m_attn[0, 0] > 0.5)
         if len(ys) > 0:
-            cy = int(ys.float().mean().item())
-            cx = int(xs.float().mean().item())
-            y0 = max(0, min(h - target, cy - target // 2))
-            x0 = max(0, min(w - target, cx - target // 2))
+            jitter_y = int(torch.randint(-32, 33, (1,)).item())
+            jitter_x = int(torch.randint(-32, 33, (1,)).item())
+            cy = int(ys.float().mean().item()) + jitter_y
+            cx = int(xs.float().mean().item()) + jitter_x
+            y0 = max(0, min(rh - target, cy - target // 2))
+            x0 = max(0, min(rw - target, cx - target // 2))
         else:
-            g = torch.Generator().manual_seed(clip_idx)
-            y0 = int(torch.randint(0, h - target + 1, (1,), generator=g).item())
-            x0 = int(torch.randint(0, w - target + 1, (1,), generator=g).item())
+            y0 = int(torch.randint(0, rh - target + 1, (1,)).item())
+            x0 = int(torch.randint(0, rw - target + 1, (1,)).item())
 
         return (
             video[:, :, y0 : y0 + target, x0 : x0 + target],
             m_attn[:, :, y0 : y0 + target, x0 : x0 + target],
             m_det[:, :, y0 : y0 + target, x0 : x0 + target],
-            self._transform_boxes_list(raw_boxes_per_frame, target, x0=float(x0), y0=float(y0)),
-            self._transform_boxes_list(raw_ignore_per_frame, target, x0=float(x0), y0=float(y0)),
+            self._transform_boxes_list(raw_boxes_per_frame, target, sx=sx, sy=sy, x0=float(x0) / sx, y0=float(y0) / sy),
+            self._transform_boxes_list(raw_ignore_per_frame, target, sx=sx, sy=sy, x0=float(x0) / sx, y0=float(y0) / sy),
         )
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
