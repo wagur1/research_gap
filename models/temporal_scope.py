@@ -1,7 +1,11 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as grad_checkpoint
 from typing import Dict, Optional, Tuple
+
+
+_GAUSSIAN_5X5_CACHE: Dict[Tuple[int, str, torch.dtype], torch.Tensor] = {}
 
 
 class SeverityConditioner(nn.Module):
@@ -55,20 +59,26 @@ class SeverityConditioner(nn.Module):
 
 class FiLMConvBlock(nn.Module):
     """
-    Two 3x3 Conv + GroupNorm + GELU layers modulated by Feature-wise Linear Modulation (FiLM):
+    Two 3x3 Conv + optional GroupNorm + GELU layers modulated by Feature-wise Linear Modulation (FiLM):
         FiLM(x, c) = x * (1 + gamma(c)) + beta(c)
     """
 
-    def __init__(self, in_ch: int, out_ch: int, cond_dim: int = 64) -> None:
+    def __init__(
+        self, in_ch: int, out_ch: int, cond_dim: int = 64, use_norm: bool = True
+    ) -> None:
         super().__init__()
-        num_groups = min(8, out_ch)
-        while num_groups > 1 and (out_ch % num_groups) != 0:
-            num_groups -= 1
         self.conv1 = nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1)
-        self.norm1 = nn.GroupNorm(num_groups, out_ch)
+        if use_norm:
+            num_groups = min(8, out_ch)
+            while num_groups > 1 and (out_ch % num_groups) != 0:
+                num_groups -= 1
+            self.norm1: nn.Module = nn.GroupNorm(num_groups, out_ch)
+            self.norm2: nn.Module = nn.GroupNorm(num_groups, out_ch)
+        else:
+            self.norm1 = nn.Identity()
+            self.norm2 = nn.Identity()
         self.act1 = nn.GELU()
         self.conv2 = nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1)
-        self.norm2 = nn.GroupNorm(num_groups, out_ch)
         self.act2 = nn.GELU()
         self.film_proj = nn.Linear(cond_dim, out_ch * 2)
 
@@ -108,13 +118,17 @@ class TemporalConvGRUCell(nn.Module):
 
 
 def gaussian_blur_5x5(x: torch.Tensor) -> torch.Tensor:
-    """Fast separable 5x5 Gaussian blur for the background simplification branch."""
-    kernel_1d = torch.tensor(
-        [1.0, 4.0, 6.0, 4.0, 1.0], device=x.device, dtype=x.dtype
-    ) / 16.0
-    kernel_2d = torch.outer(kernel_1d, kernel_1d).view(1, 1, 5, 5)
+    """Fast separable 5x5 Gaussian blur with per-(channel, device, dtype) cached weights."""
     c = x.shape[1]
-    weight = kernel_2d.repeat(c, 1, 1, 1)
+    key = (c, str(x.device), x.dtype)
+    weight = _GAUSSIAN_5X5_CACHE.get(key)
+    if weight is None:
+        kernel_1d = torch.tensor(
+            [1.0, 4.0, 6.0, 4.0, 1.0], device=x.device, dtype=x.dtype
+        ) / 16.0
+        kernel_2d = torch.outer(kernel_1d, kernel_1d).view(1, 1, 5, 5)
+        weight = kernel_2d.repeat(c, 1, 1, 1).contiguous()
+        _GAUSSIAN_5X5_CACHE[key] = weight
     x_pad = F.pad(x, (2, 2, 2, 2), mode="reflect")
     return F.conv2d(x_pad, weight, groups=c)
 
@@ -152,23 +166,25 @@ class TemporalSCOPE(nn.Module):
 
         # Encoder: HxW -> H/2xW/2 -> H/4xW/4 (+ H/8xW/8 global context branch)
         # Input channels: 3 (current frame I_t) + 3 (temporal frame diff I_t - I_{t-1}) = 6
-        self.enc1 = FiLMConvBlock(6, base_ch, cond_dim)
+        # Skip GroupNorm at full HxW resolution (enc1/dec1) to avoid FP32 bandwidth bottlenecks;
+        # retain GroupNorm at H/2..H/8 where feature normalization matters most.
+        self.enc1 = FiLMConvBlock(6, base_ch, cond_dim, use_norm=False)
         self.down1 = nn.Conv2d(base_ch, base_ch * 2, kernel_size=4, stride=2, padding=1)
-        self.enc2 = FiLMConvBlock(base_ch * 2, base_ch * 2, cond_dim)
+        self.enc2 = FiLMConvBlock(base_ch * 2, base_ch * 2, cond_dim, use_norm=True)
         self.down2 = nn.Conv2d(base_ch * 2, base_ch * 4, kernel_size=4, stride=2, padding=1)
-        self.bottleneck = FiLMConvBlock(base_ch * 4, base_ch * 4, cond_dim)
+        self.bottleneck = FiLMConvBlock(base_ch * 4, base_ch * 4, cond_dim, use_norm=True)
         self.down3 = nn.Conv2d(base_ch * 4, base_ch * 4, kernel_size=4, stride=2, padding=1)
-        self.enc3 = FiLMConvBlock(base_ch * 4, base_ch * 4, cond_dim)
-        self.ctx_fuse = FiLMConvBlock(base_ch * 8, base_ch * 4, cond_dim)
+        self.enc3 = FiLMConvBlock(base_ch * 4, base_ch * 4, cond_dim, use_norm=True)
+        self.ctx_fuse = FiLMConvBlock(base_ch * 8, base_ch * 4, cond_dim, use_norm=True)
 
         # Recurrent Temporal Alignment at H/4 x W/4
         self.temporal_gru = TemporalConvGRUCell(base_ch * 4)
 
         # Decoder: H/4xW/4 -> H/2xW/2 -> HxW
         self.up2 = nn.Conv2d(base_ch * 4, base_ch * 2, kernel_size=3, padding=1)
-        self.dec2 = FiLMConvBlock(base_ch * 4, base_ch * 2, cond_dim)
+        self.dec2 = FiLMConvBlock(base_ch * 4, base_ch * 2, cond_dim, use_norm=True)
         self.up1 = nn.Conv2d(base_ch * 2, base_ch, kernel_size=3, padding=1)
-        self.dec1 = FiLMConvBlock(base_ch * 2, base_ch, cond_dim)
+        self.dec1 = FiLMConvBlock(base_ch * 2, base_ch, cond_dim, use_norm=False)
 
         # Output prediction heads
         self.attn_head = nn.Conv2d(base_ch, 1, kernel_size=3, padding=1)
@@ -250,18 +266,22 @@ class TemporalSCOPE(nn.Module):
         # Object-preserving branch
         i_obj_t = torch.clamp(i_t + delta_obj_t, 0.0, 1.0)
 
-        # Severity-conditioned low-pass background branch (5x5 -> 13x13 Gaussian blend)
+        # Severity-conditioned low-pass background branch (5x5 -> multi-scale ~11x11 Gaussian blend)
         blur_mild = gaussian_blur_5x5(i_t)
-        blur_strong = gaussian_blur_5x5(gaussian_blur_5x5(blur_mild))
+        blur_strong = F.interpolate(
+            gaussian_blur_5x5(F.avg_pool2d(blur_mild, kernel_size=2, stride=2)),
+            size=i_t.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        )
         blur_mix = self.bg_blur_strength(c).view(-1, 1, 1, 1)
         blur_i_t = (1.0 - blur_mix) * blur_mild + blur_mix * blur_strong
         i_bg_spatial = torch.clamp(blur_i_t + delta_bg_t, 0.0, 1.0)
         if bg_prev is not None:
             # Strong motion gating (exp(-30*mm)) avoids double-exposure ghosting on panning cameras
-            blur_diff_t = gaussian_blur_5x5(diff_t)
-            motion_mag = (
-                0.7 * diff_t.abs().mean(dim=1, keepdim=True)
-                + 0.3 * blur_diff_t.abs().mean(dim=1, keepdim=True)
+            diff_mag = diff_t.abs().mean(dim=1, keepdim=True)
+            motion_mag = 0.7 * diff_mag + 0.3 * F.avg_pool2d(
+                diff_mag, kernel_size=5, stride=1, padding=2
             )
             static_mask = torch.exp(-30.0 * motion_mag)
             temporal_weight = 0.92 * torch.sigmoid(self.bg_temporal_gate(u1)) * static_mask
@@ -302,6 +322,7 @@ class TemporalSCOPE(nn.Module):
         h_prev: Optional[torch.Tensor] = None
         bg_prev: Optional[torch.Tensor] = None
 
+        use_ckpt = self.training and torch.is_grad_enabled() and t > 1
         for step in range(t):
             i_t = video[:, step]
             if disable_temporal:
@@ -310,9 +331,20 @@ class TemporalSCOPE(nn.Module):
                 bg_prev = None
             else:
                 i_prev = video[:, step - 1] if step > 0 else i_t
-            i_edit_t, attn_t, d_obj_t, d_bg_t, h_prev, bg_prev = self.forward_single_step(
-                i_t, i_prev, c, h_prev, bg_prev
-            )
+            if use_ckpt:
+                i_edit_t, attn_t, d_obj_t, d_bg_t, h_prev, bg_prev = grad_checkpoint(
+                    self.forward_single_step,
+                    i_t,
+                    i_prev,
+                    c,
+                    h_prev,
+                    bg_prev,
+                    use_reentrant=False,
+                )
+            else:
+                i_edit_t, attn_t, d_obj_t, d_bg_t, h_prev, bg_prev = self.forward_single_step(
+                    i_t, i_prev, c, h_prev, bg_prev
+                )
             edits.append(i_edit_t)
             attns.append(attn_t)
             d_objs.append(d_obj_t)

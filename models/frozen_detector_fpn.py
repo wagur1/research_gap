@@ -94,18 +94,64 @@ class FrozenFPNDetectorTeacher(nn.Module):
                 feats["yolo_p5"] = cur
         return feats
 
+    def _extract_resnet_fpn_tuple(self, images: torch.Tensor) -> Tuple[torch.Tensor, ...]:
+        x_norm = self.normalize(images)
+        feats = self.detector.backbone(x_norm)
+        return tuple(
+            feat for idx, (_, feat) in enumerate(feats.items()) if idx < 4
+        )
+
+    def _extract_yolo_fpn_tuple(self, images: torch.Tensor) -> Tuple[torch.Tensor, ...]:
+        y_feats = self.extract_yolo_backbone_features(images)
+        return (y_feats["yolo_p3"], y_feats["yolo_p4"], y_feats["yolo_p5"])
+
     def extract_backbone_fpn_features(self, images: torch.Tensor) -> Dict[str, torch.Tensor]:
         """Full ResNet50-FPN v2 (+ optional YOLOv8s CSPDarknet) feature extractor."""
-        x_norm = self.normalize(images)
         if self.use_torchvision and self.detector is not None:
             self.detector.eval()
+            use_yolo = bool(self.use_yolov8s and self.yolo_model is not None)
+            if torch.is_grad_enabled() and images.requires_grad:
+                from torch.utils.checkpoint import checkpoint as grad_checkpoint
+
+                chunk_size = 4
+                n_imgs = images.shape[0]
+                res_chunks = []
+                yolo_chunks = []
+                for start in range(0, n_imgs, chunk_size):
+                    chunk = images[start : start + chunk_size]
+                    res_chunks.append(
+                        grad_checkpoint(self._extract_resnet_fpn_tuple, chunk, use_reentrant=False)
+                    )
+                    if use_yolo:
+                        yolo_chunks.append(
+                            grad_checkpoint(self._extract_yolo_fpn_tuple, chunk, use_reentrant=False)
+                        )
+                num_res = len(res_chunks[0])
+                out = {
+                    f"p{idx + 2}": (
+                        res_chunks[0][idx]
+                        if len(res_chunks) == 1
+                        else torch.cat([c[idx] for c in res_chunks], dim=0)
+                    )
+                    for idx in range(num_res)
+                }
+                if use_yolo:
+                    for idx, name in enumerate(("yolo_p3", "yolo_p4", "yolo_p5")):
+                        out[name] = (
+                            yolo_chunks[0][idx]
+                            if len(yolo_chunks) == 1
+                            else torch.cat([c[idx] for c in yolo_chunks], dim=0)
+                        )
+                return out
+
+            x_norm = self.normalize(images)
             feats = self.detector.backbone(x_norm)
             out = {
                 f"p{idx + 2}": feat
                 for idx, (_, feat) in enumerate(feats.items())
                 if idx < 4
             }
-            if self.use_yolov8s and self.yolo_model is not None:
+            if use_yolo:
                 out.update(self.extract_yolo_backbone_features(images))
             return out
         return self.extract_fast_pyramid(images)
