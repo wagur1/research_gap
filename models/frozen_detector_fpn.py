@@ -46,7 +46,7 @@ class FrozenFPNDetectorTeacher(nn.Module):
                     from ultralytics import YOLO
 
                     wrapper = YOLO("yolov8s.pt")
-                    self.yolo_wrapper = wrapper
+                    self._yolo_wrapper_holder = [wrapper]
                     self.yolo_model = wrapper.model
                     self.yolo_model.eval()
                     for p in self.yolo_model.parameters():
@@ -62,6 +62,12 @@ class FrozenFPNDetectorTeacher(nn.Module):
         self.register_buffer(
             "std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
         )
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name == "yolo_wrapper":
+            self._yolo_wrapper_holder = [] if value is None else [value]
+            return
+        super().__setattr__(name, value)
 
     @property
     def yolo_wrapper(self) -> Any:
