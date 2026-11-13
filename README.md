@@ -241,3 +241,17 @@ Nguồn: [`outputs_kaggle_pool/benchmark_512x512_16x16roi.json`](./outputs_kaggl
 Chi tiết kiểm định can thiệp Gate 0 (`G0.1..G0.5`) lưu tại [`outputs_rigor_gate0_gate1/rigor_gate0_gate1_report.json`](./outputs_rigor_gate0_gate1/rigor_gate0_gate1_report.json) và pilot đa detector lưu tại [`outputs_rigor_gate0_gate1/cross_backbone_bdbr.json`](./outputs_rigor_gate0_gate1/cross_backbone_bdbr.json).
 
 
+
+---
+
+## 6. Ghi chú Hiệu năng GPU & Tùy chọn Tăng FPS (`512×512`)
+
+Đo thực tế trên **Kaggle Tesla T4** (`commit b824416`, `TemporalSCOPE` `6.11M` tham số, clip `T=4` ở `512×512`):
+- **Inference (`AMP FP16`, `B=1`):** **`19.10 FPS`** (`52.36 ms/frame`, peak VRAM `0.485 GB`).
+- **Inference (`FP32`, `B=1`):** **`5.52 FPS`** (`181.21 ms/frame`, peak VRAM `0.610 GB`).
+- **Training (`B=2, T=4`, FRCNN + YOLOv8s + `libx265` STE):** **`3.219 GB`** peak VRAM (nhờ gradient checkpointing theo chunk FPN và từng bước `T`), tốc độ `3.562 s/step`.
+
+### Tùy chọn tối ưu FPS nếu cần vượt `30–40+ FPS` ngay trên Tesla T4 (không ép ở đợt train hiện tại)
+1. **Thu gọn kênh / lớp ở tầng full-res `512×512`:** Hạ `TemporalSCOPE(base_ch=32)` (thay vì `48`) hoặc chuyển `enc1`/`dec1` sang depthwise-separable conv — giữ nguyên độ phân giải biên `512×512` cho người đi bộ nhỏ & halo `4px` nhưng giảm đáng kể GMACs.
+2. **Dual-resolution `PixelUnshuffle(2)` stem:** Đưa khối UNet chính xuống `H/2` (`256×256`) và giữ 1 nhánh residual nhẹ ở `H×W` để vừa tăng mạnh FPS vừa hạn chế thô ô `2×2` ở viền mask.
+3. **Tối ưu runtime triển khai:** Dùng `torch.compile` hoặc TensorRT FP16 ở pha suy luận (không làm thay đổi kiến trúc hay BD-rate).
