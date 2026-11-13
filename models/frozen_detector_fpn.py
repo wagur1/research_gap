@@ -22,7 +22,7 @@ class FrozenFPNDetectorTeacher(nn.Module):
         self.use_torchvision = False
         self.detector = None
         self.use_yolov8s = False
-        self.yolo_wrapper = None
+        self._yolo_wrapper_holder: List[Any] = []
         self.yolo_model = None
 
         if pretrained:
@@ -45,8 +45,9 @@ class FrozenFPNDetectorTeacher(nn.Module):
                 try:
                     from ultralytics import YOLO
 
-                    self.yolo_wrapper = YOLO("yolov8s.pt")
-                    self.yolo_model = self.yolo_wrapper.model
+                    wrapper = YOLO("yolov8s.pt")
+                    self.yolo_wrapper = wrapper
+                    self.yolo_model = wrapper.model
                     self.yolo_model.eval()
                     for p in self.yolo_model.parameters():
                         p.requires_grad_(False)
@@ -61,6 +62,15 @@ class FrozenFPNDetectorTeacher(nn.Module):
         self.register_buffer(
             "std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
         )
+
+    @property
+    def yolo_wrapper(self) -> Any:
+        """Store Ultralytics YOLO outside nn.Module._modules so .eval() never triggers YOLO.train()."""
+        return self._yolo_wrapper_holder[0] if self._yolo_wrapper_holder else None
+
+    @yolo_wrapper.setter
+    def yolo_wrapper(self, value: Any) -> None:
+        self._yolo_wrapper_holder = [] if value is None else [value]
 
     def normalize(self, x: torch.Tensor) -> torch.Tensor:
         return (x - self.mean.to(dtype=x.dtype)) / self.std.to(dtype=x.dtype)

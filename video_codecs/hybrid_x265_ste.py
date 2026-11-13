@@ -1,9 +1,11 @@
 import json
 import math
+import os
 import shutil
 import subprocess
 import sys
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -508,18 +510,24 @@ class HybridX265STE(nn.Module):
 
         # Hybrid STE mode: run real x265 in forward pass (with ctu_qp_offsets!), proxy in backward pass
         b = video_edit.shape[0]
-        real_recons = []
-        real_bpps = []
-        real_frame_bpps = []
-        for idx in range(b):
+        def _encode_one(idx: int):
             qp_val = int(round(22.0 + 25.0 * float(severity[idx].item())))
             off_i = ctu_qp_offsets[idx].detach() if ctu_qp_offsets is not None else None
             recon_i, bpp_i, f_bpps_i, _ = self.encode_decode_x265_clip(
                 video_edit[idx].detach(), qp_val, off_i
             )
-            real_recons.append(recon_i)
-            real_bpps.append(bpp_i)
-            real_frame_bpps.append(f_bpps_i)
+            return recon_i, bpp_i, f_bpps_i
+
+        if b > 1:
+            workers = min(b, max(2, os.cpu_count() or 4), 8)
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                results = list(pool.map(_encode_one, range(b)))
+        else:
+            results = [_encode_one(0)]
+
+        real_recons = [r[0] for r in results]
+        real_bpps = [r[1] for r in results]
+        real_frame_bpps = [r[2] for r in results]
 
         video_real = torch.stack(real_recons, dim=0)
         frame_bpps_real = torch.stack(real_frame_bpps, dim=0)
