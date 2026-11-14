@@ -276,7 +276,7 @@ class HybridX265STE(nn.Module):
 
         if not any_roi:
             return []
-        branches.append(f"{out_pads}interleave=n={t_frames}")
+        branches.append(f"{out_pads}concat=n={t_frames}:v=1:a=0,settb=1/25,setpts=N")
         return ["-vf", ";".join(branches)]
 
     @torch.no_grad()

@@ -3,13 +3,14 @@ import datetime
 import time
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import warnings
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 warnings.filterwarnings("ignore")
 
@@ -165,23 +166,24 @@ if RUN_MODE in ("eval_poc", "both"):
     subprocess.run(cmd_eval, cwd=str(repo_dir), env=env, check=True)
 
 if RUN_MODE == "eval_soup":
-    for soup_variant in ["full_tscope", "spatial_only_scope", "wo_ctu_delta_qp", "iwa_gop_qp_reuse", "proxy_only_zhao"]:
-        soup_ckpt = repo_dir / "release_ckpts" / f"tscope_soup_{{soup_variant}}.pt"
-        cmd_eval = [
-            sys.executable,
-            str(repo_dir / "scripts" / "kaggle_shard_runner.py"),
-            "--mode", "eval_poc",
-            "--shard_id", str(SHARD_ID),
-            "--num_shards", str(NUM_SHARDS),
-            "--variant", soup_variant,
-            "--img_size", str(IMG_SIZE),
-            "--ckpt", str(soup_ckpt),
-            "--use_pretrained_fpn",
-            "--output_dir", "/kaggle/working",
-        ]
-        if USE_YOLOV8S:
-            cmd_eval.append("--use_yolov8s")
-        subprocess.run(cmd_eval, cwd=str(repo_dir), env=env, check=True)
+    backup_map = {{4: 0, 5: 1, 6: 2, 7: 3, 10: 8, 11: 9, 13: 12, 15: 14, 16: 20}}
+    assigned_shards = [SHARD_ID]
+    if SHARD_ID in backup_map:
+        assigned_shards.append(backup_map[SHARD_ID])
+    cmd_eval = [
+        sys.executable,
+        str(repo_dir / "scripts" / "kaggle_shard_runner.py"),
+        "--mode", "eval_all_variants",
+        "--shard_ids", *[str(s) for s in assigned_shards],
+        "--num_shards", str(NUM_SHARDS),
+        "--img_size", str(IMG_SIZE),
+        "--soup_dir", str(repo_dir / "release_ckpts"),
+        "--use_pretrained_fpn",
+        "--output_dir", "/kaggle/working",
+    ]
+    if USE_YOLOV8S:
+        cmd_eval.append("--use_yolov8s")
+    subprocess.run(cmd_eval, cwd=str(repo_dir), env=env, check=True)
 
 print(f"=== Shard {{SHARD_ID}}/{{NUM_SHARDS}} ({{VARIANT}}) finished successfully! ===")
 '''
@@ -339,6 +341,65 @@ def check_status_all(args: argparse.Namespace, accounts: List[Tuple[str, str]]) 
             print(f"  [Shard {shard_id:02d}] {kernel_id:<40} : {e}")
 
 
+def _collect_dir_files(directory: Path) -> List[Dict[str, Any]]:
+    return [
+        {
+            "path": str(path.relative_to(directory)),
+            "bytes": path.stat().st_size,
+            "sha256": sha256_file(path),
+        }
+        for path in sorted(directory.rglob("*"))
+        if path.is_file() and not path.is_symlink()
+    ]
+
+
+def _route_backup_eval_outputs(manifest: Dict[str, Any], collection: Path, num_shards: int) -> None:
+    """Moves recovered backup eval_shard_<sid>of<N>_*.json outputs to each target shard entry."""
+    pattern = re.compile(rf"^eval_shard_(\d+)of{num_shards:02d}_.+\.json$")
+    entry_by_id = {entry["shard_id"]: entry for entry in manifest["shards"]}
+    touched_shards = set()
+
+    for host_entry in manifest["shards"]:
+        host_dir_str = host_entry.get("directory")
+        if not host_dir_str:
+            continue
+        host_dir = Path(host_dir_str)
+        host_sid = int(host_entry["shard_id"])
+        for path in sorted(host_dir.rglob("*.json")):
+            if not path.is_file() or path.is_symlink():
+                continue
+            match = pattern.match(path.name)
+            if not match:
+                continue
+            target_sid = int(match.group(1))
+            if target_sid == host_sid or target_sid not in entry_by_id:
+                continue
+            target_entry = entry_by_id[target_sid]
+            target_dir_str = target_entry.get("directory")
+            if not target_dir_str:
+                target_dir = Path(tempfile.mkdtemp(prefix=f"shard_{target_sid:02d}_", dir=collection))
+                target_entry["directory"] = str(target_dir)
+                target_entry["downloaded"] = True
+            else:
+                target_dir = Path(target_dir_str)
+            dest = target_dir / path.name
+            if dest.exists():
+                path.unlink()
+            else:
+                shutil.move(str(path), str(dest))
+                recovered = target_entry.setdefault("recovered_from_shards", [])
+                if host_sid not in recovered:
+                    recovered.append(host_sid)
+            touched_shards.add(host_sid)
+            touched_shards.add(target_sid)
+
+    for sid in touched_shards:
+        entry = entry_by_id[sid]
+        entry["files"] = _collect_dir_files(Path(entry["directory"]))
+        if entry.get("recovered_from_shards"):
+            print(f"  [Shard {sid:02d}] Routed {len(entry['files'])} files from backup shard(s) {entry['recovered_from_shards']}")
+
+
 def pull_and_merge_all(args: argparse.Namespace, accounts: List[Tuple[str, str]]) -> None:
     num_shards = len(accounts)
     if num_shards != 21:
@@ -363,7 +424,7 @@ def pull_and_merge_all(args: argparse.Namespace, accounts: List[Tuple[str, str]]
                 destination = Path(tempfile.mkdtemp(prefix=f"shard_{shard_id:02d}_", dir=collection))
                 entry["directory"] = str(destination)
                 download_kernel_outputs(api, kernel_id, destination)
-                entry["files"] = [{"path": str(path.relative_to(destination)), "bytes": path.stat().st_size, "sha256": sha256_file(path)} for path in sorted(destination.rglob("*")) if path.is_file() and not path.is_symlink()]
+                entry["files"] = _collect_dir_files(destination)
                 entry["downloaded"] = True
                 print(f"  [Shard {shard_id:02d}] Downloaded {len(entry['files'])} files")
         except Exception as error:
@@ -372,6 +433,8 @@ def pull_and_merge_all(args: argparse.Namespace, accounts: List[Tuple[str, str]]
         manifest["shards"].append(entry)
         (collection / "collection_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
         time.sleep(1.5)
+    _route_backup_eval_outputs(manifest, collection, num_shards)
+    (collection / "collection_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     print(f"Collection manifest -> {collection / 'collection_manifest.json'}")
     print("No automatic merge performed. Use scripts/merge_shards.py with the checked manifest.")
 

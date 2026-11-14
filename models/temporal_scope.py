@@ -222,9 +222,8 @@ class TemporalSCOPE(nn.Module):
 
         tau = 0.30
         bg_part = F.relu(tau - qg_attn) / tau
-        fg_part = F.relu(qg_attn - tau) / (1.0 - tau)
-        delta_qp = self.max_delta_qp * (1.75 * bg_part - 1.0 * fg_part)
-        delta_qp = torch.clamp(delta_qp, min=-0.18 * 51.0, max=0.14 * 51.0)
+        delta_qp = self.max_delta_qp * (1.75 * bg_part)
+        delta_qp = torch.clamp(delta_qp, min=0.0, max=0.14 * 51.0)
         delta_qp = delta_qp.view(b, t, delta_qp.shape[-2], delta_qp.shape[-1])
 
         if reuse_iframe_across_gop and t > 1:

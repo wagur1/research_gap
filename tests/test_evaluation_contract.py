@@ -42,7 +42,7 @@ class EvaluationContractTests(unittest.TestCase):
         self.assertIn("split=3", graph)
         for index in range(3):
             self.assertIn(f"select='eq(n,{index})'", graph)
-        self.assertIn("interleave=n=3", graph)
+        self.assertIn("concat=n=3:v=1:a=0,settb=1/25,setpts=N", graph)
         self.assertIn("qoffset=0.14000", graph)
 
     @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "Real codec tools unavailable")
