@@ -135,7 +135,7 @@ python -I scripts/kaggle_pool_orchestrator.py --pool_file "C:\Users\Wagur1\Downl
 # 4. Tải các output hoàn tất vào thư mục riêng từng kernel; không tự gộp kết quả thiếu
 python -I scripts/kaggle_pool_orchestrator.py --pool_file "C:\Users\Wagur1\Downloads\pool (2).json" --action pull --output_dir ./outputs_kaggle_pool
 
-# 5. Gộp từ manifest đã kiểm tra; xem HANDOVER_TASK_BRIEF.md cho validation và eval_soup
+# 5. Gộp checkpoint từ manifest đã kiểm tra (xem thêm docs/V1_PRELIMINARY_BENCHMARK_REPORT.md)
 python -I scripts/merge_shards.py --action soup --manifest "<collection_manifest.json>" --ckpt_dir "<new_soup_dir>" --merged_ckpt "<new_soup_dir>/tscope_merged_soup.pt"
 ```
 
@@ -172,75 +172,73 @@ VARIANT = "full_tscope"  # Hoặc: spatial_only_scope | wo_ctu_delta_qp | iwa_go
 ---
 
 
-## 5. Kết quả Thực nghiệm (`libx265` thật + `ffprobe pkt_size` + Dataset-Level 101-Point GT AP trên Tập Held-Out `MOT17-11` & `MOT17-13`)
+## 5. Kết quả Thực nghiệm Đóng gói v1 (`512×512`, `libx265` + `ffprobe` + 1.648 Frame Held-Out)
 
-> **Cập nhật hoàn tất Handover 2026-11-12 (Final-Ready Schema-v2 Benchmark):**
-> - **21/21 checkpoint hội tụ** (`collection_complete_majwx85s`) đã gộp và hoàn tất validation đầy đủ trên 525 frame `MOT17-09` cho **cả 5/5 Model Soup** (`validated_all_soups_20261112`, `release_ready=true`, xuất bản tại `release_ckpts/tscope_soup_<variant>.pt` ở commit `e38e7e00a2f99c68077e66aae13cf7350b3f2104`).
-> - **21/21 shard đánh giá ghép cặp (`105/105` file JSON)** trên toàn bộ **1.648 frame held-out** (`MOT17-11`: frame `1..900`; `MOT17-13`: frame `1..748`; loại trừ 2 frame lẻ cuối `749..750`) đã gộp và kiểm định qua [`outputs_kaggle_pool/merged_benchmarks.json`](./outputs_kaggle_pool/merged_benchmarks.json) (`final_ready=true`).
-> - **Protocol bảo toàn:** QG `16×16`, scale `max_delta_qp=4.0` cho `full_tscope`/`iwa_gop_qp_reuse` (có trừ trung bình không gian), lưới ROI `addroi` tối đa `8×8` vùng, `qoffset` clamp `[-0.18, +0.06]`, codec `ffmpeg -c:v libx265 -preset medium -x265-params aq-mode=2:bframes=0` tại CRF `[22, 27, 32, 37]`, bitrate tính từ tổng byte payload video-packet MP4 (`ffprobe -show_packets`), và detector thực `fasterrcnn_resnet50_fpn_v2` (`FasterRCNN_ResNet50_FPN_V2_Weights.DEFAULT`) với **COCO-style 101-point dataset-level pedestrian AP** (có lọc distractor/ignore-IoU chuẩn MOT17). Xem chi tiết tại [`HANDOVER_TASK_BRIEF.md`](./HANDOVER_TASK_BRIEF.md).
+> **Báo cáo đầy đủ:** [`docs/V1_PRELIMINARY_BENCHMARK_REPORT.md`](./docs/V1_PRELIMINARY_BENCHMARK_REPORT.md) | **Dữ liệu gốc hợp lệ (`final_ready=true`, `105/105` JSON):** [`outputs_kaggle_pool/merged_benchmarks.json`](./outputs_kaggle_pool/merged_benchmarks.json)
+> - **Tập kiểm thử:** `1,648` khung hình không chồng lấn (`MOT17-11`: `900` frame `000001..000900`; `MOT17-13`: `748` frame `000001..000748`, loại 2 frame đuôi `749..750`), resize `bilinear_square` `512×512`, `clip_len=4`.
+> - **Giao thức mã hóa & dò:** `ffmpeg -c:v libx265 -preset medium -x265-params aq-mode=2:bframes=0` (`IPPP`, `CRF ∈ {22, 27, 32, 37}`), lưới `addroi` tối đa `16×16` vùng (`qoffset ∈ [-0.18, +0.14]`), bitrate đo từ byte payload video-packet MP4 (`ffprobe -show_packets`), detector `fasterrcnn_resnet50_fpn_v2` và `YOLOv8s` với dataset-level 101-point pedestrian AP.
+> - **5/5 Model Soup kiểm chứng trên `MOT17-09` (`release_ckpts/`):** `full_tscope` (`val_loss=3.141676`), `iwa_gop_qp_reuse` (`3.117673`), `wo_ctu_delta_qp` (`3.136038`), `proxy_only_zhao` (`1.959265`), `spatial_only_scope` (`2.114932`).
 
-### 5.1. So sánh Tổng thể trên 1.648 Frame Held-Out (`full_tscope` Cohort, Dataset-Level 101-Point AP & Packet-Payload BDBR)
+### 5.1. So sánh Tổng thể trên 1.648 Frame Held-Out (`overall_methods_summary`)
 
-Nguồn: [`outputs_kaggle_pool/merged_benchmarks.json`](./outputs_kaggle_pool/merged_benchmarks.json) (`overall_methods_summary`), biểu đồ [`docs/figures/fig_bdbr_curves.png`](./docs/figures/fig_bdbr_curves.png).
+*(Giá trị BDBR âm = tiết kiệm bitrate ở cùng AP; giá trị dương = tốn thêm bitrate)*
 
-| Phương pháp | Total BDBR (`GT AP@50`) | P-Frame BDBR (`GT AP@50`) | Total BDBR (`GT AP@[.50:.95]`) | P-Frame BDBR (`GT AP@[.50:.95]`) | Total BPP (`CRF 22 / 27 / 32 / 37`) | Dataset `GT AP@50` (`CRF 22 / 27 / 32 / 37`) |
-| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
-| `anchor_x265` (Trực tiếp `libx265`) | `+0.00%` | `+0.00%` | `+0.00%` | `+0.00%` | `1.3141 / 0.6506 / 0.2973 / 0.1260` | `47.83% / 42.70% / 36.29% / 23.74%` |
-| `deterministic_blur_ema` (Không học) | `+39.84%` | `+70.04%` | `+48.83%` | `+85.85%` | `1.2921 / 0.6227 / 0.2715 / 0.1094` | `43.34% / 38.93% / 32.19% / 19.91%` |
-| `spatial_scope_framewise` (Độc lập từng frame) | `-3.06%` | `-3.24%` | `-4.09%` | `-4.53%` | `1.2339 / 0.6105 / 0.2797 / 0.1196` | `47.16% / 42.53% / 36.13% / 23.78%` |
-| **`tscope_temporal_ctu_qp` (`full_tscope`)** | **`-7.10%`** | **`-5.36%`** | **`-5.60%`** | **`-3.11%`** | `1.3170 / 0.6573 / 0.3028 / 0.1299` | **`48.47% / 44.21% / 37.12% / 26.22%`** |
-| `oracle_gt_mask_upper_bound` (Cận trên, dùng GT) | `-48.27%` | `-51.45%` | `-47.55%` | `-50.65%` | `0.7062 / 0.3916 / 0.2022 / 0.0986` | `48.78% / 45.11% / 39.12% / 28.65%` |
+| Phương pháp | Total BDBR (`FRCNN AP50`) | Total BDBR (`FRCNN AP50:95`) | P-BPP BDBR (`FRCNN AP50`) | P-BPP BDBR (`FRCNN AP50:95`) | Total BDBR (`YOLO AP50`) | Total BDBR (`YOLO AP50:95`) | P-BPP BDBR (`YOLO AP50`) | P-BPP BDBR (`YOLO AP50:95`) |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `anchor_x265` | `0.00%` | `0.00%` | `0.00%` | `0.00%` | `0.00%` | `0.00%` | `0.00%` | `0.00%` |
+| `deterministic_blur_ema` | `+33.87%` | `+36.18%` | `+71.86%` | `+76.36%` | `+27.52%` | `+34.82%` | `+60.45%` | `+73.80%` |
+| `spatial_scope_framewise` | **`-16.20%`** | **`-14.44%`** | **`-16.59%`** | **`-14.22%`** | **`-14.69%`** | **`-12.22%`** | **`-14.57%`** | **`-11.11%`** |
+| `tscope_temporal_ctu_qp` (`full_tscope`) | `-15.52%` | `-11.52%` | `+18.53%` | `+25.52%` | `-13.86%` | `-9.92%` | `+21.33%` | `+28.31%` |
+| `oracle_gt_mask_upper_bound` | **`-43.57%`** | **`-44.25%`** | **`-33.50%`** | **`-34.59%`** | **`-33.74%`** | **`-41.68%`** | **`-17.37%`** | **`-30.30%`** |
 
-### 5.2. Ablation Đa Nhân tố theo Variant (`ablation_variants_summary`, 1.648 Frame Held-Out Ghép cặp)
+### 5.2. Đường cong từng mức CRF (`1,648` frames) & Ablation 5 Biến thể (`ablation_variants_summary`)
 
-Nguồn: [`outputs_kaggle_pool/merged_benchmarks.json`](./outputs_kaggle_pool/merged_benchmarks.json), biểu đồ [`docs/figures/fig_ablation_bdbr.png`](./docs/figures/fig_ablation_bdbr.png) và kiểm tra trực quan pre-edit [`docs/figures/ablation_preedit_comparison_grid.png`](./docs/figures/ablation_preedit_comparison_grid.png).
+| Phương pháp | CRF | Total bpp | I-frame bpp | P-frame bpp | ROI PSNR (dB) | FRCNN AP50 | FRCNN AP50:95 | YOLO AP50 | YOLO AP50:95 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `anchor_x265` | 22 / 27 / 32 / 37 | `0.6606 / 0.3352 / 0.1662 / 0.0795` | `1.4567 / 0.8652 / 0.4849 / 0.2538` | `0.3952 / 0.1586 / 0.0600 / 0.0214` | `32.95 / 29.77 / 26.79 / 23.98` | `56.39% / 53.93% / 49.33% / 39.45%` | `33.08% / 31.70% / 28.68% / 22.42%` | `50.46% / 48.55% / 44.76% / 36.33%` | `29.37% / 28.19% / 25.64% / 20.26%` |
+| `spatial_scope_framewise` | 22 / 27 / 32 / 37 | `0.5000 / 0.2626 / 0.1351 / 0.0678` | `1.1429 / 0.6914 / 0.3976 / 0.2162` | `0.2857 / 0.1196 / 0.0477 / 0.0184` | `30.76 / 28.50 / 26.09 / 23.66` | `56.66% / 53.93% / 48.57% / 39.48%` | `32.91% / 31.31% / 28.11% / 22.10%` | `50.55% / 48.64% / 44.22% / 36.05%` | `29.26% / 27.94% / 25.02% / 19.74%` |
+| `tscope_temporal_ctu_qp` (`full_tscope`) | 22 / 27 / 32 / 37 | `0.3905 / 0.2076 / 0.1079 / 0.0548` | `0.8019 / 0.4871 / 0.2822 / 0.1575` | `0.2534 / 0.1144 / 0.0497 / 0.0206` | `28.33 / 26.70 / 24.80 / 22.81` | `54.02% / 51.25% / 46.66% / 37.68%` | `31.66% / 29.79% / 26.30% / 20.42%` | `48.90% / 46.69% / 42.14% / 33.68%` | `28.32% / 26.61% / 23.42% / 17.72%` |
+| `oracle_gt_mask_upper_bound` | 22 / 27 / 32 / 37 | `0.2994 / 0.1626 / 0.0850 / 0.0434` | `0.6676 / 0.4065 / 0.2350 / 0.1306` | `0.1767 / 0.0813 / 0.0350 / 0.0143` | `32.42 / 29.21 / 26.18 / 23.41` | `56.85% / 54.06% / 47.73% / 37.15%` | `32.97% / 31.21% / 27.66% / 21.62%` | `48.71% / 47.15% / 43.22% / 34.46%` | `28.65% / 27.42% / 24.88% / 19.64%` |
 
-| Variant (`tscope_soup_<variant>.pt`) | MOT17-09 Val Loss | Total BDBR (`GT AP@50`) | P-Frame BDBR (`GT AP@50`) | Total BDBR (`GT AP@[.50:.95]`) | P-Frame BDBR (`GT AP@[.50:.95]`) | `GT AP@50` tại `CRF 27 / 32 / 37` |
-| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
-| `proxy_only_zhao` *(Baseline proxy nội bộ)* | `12.4451` | `+0.25%` | `+0.89%` | `-3.02%` | `-3.50%` | `42.65% / 36.17% / 23.80%` |
-| `wo_ctu_delta_qp` *(T-SCOPE không dùng QG offset)* | `12.3009` | `-3.01%` | `-3.47%` | `-5.71%` | `-7.19%` | `43.17% / 36.37% / 23.92%` |
-| `spatial_only_scope` *(Baseline không gian đa yếu tố)* | `12.4156` | `-3.06%` | `-3.24%` | `-4.09%` | `-4.53%` | `42.53% / 36.13% / 23.78%` |
-| **`full_tscope` *(Đầy đủ: ConvGRU + STE + QG mỗi frame)*** | `12.7426` | **`-7.10%`** | **`-5.36%`** | **`-5.60%`** | **`-3.11%`** | **`44.21% / 37.12% / 26.22%`** |
-| **`iwa_gop_qp_reuse` *(T-SCOPE tái sử dụng QG từ I-frame)*** | `12.5949` | **`-9.32%`** | **`-9.00%`** | **`-8.66%`** | **`-8.06%`** | **`44.13% / 37.66% / 26.39%`** |
+| Variant (`tscope_soup_<variant>.pt`) | MOT17-09 Val Loss | Total FRCNN AP50 | Total FRCNN AP50:95 | P-BPP FRCNN AP50 | P-BPP FRCNN AP50:95 | Total YOLO AP50 | Total YOLO AP50:95 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `full_tscope` | `3.141676` | `-15.52%` | `-11.52%` | `+18.53%` | `+25.52%` | `-13.86%` | `-9.92%` |
+| `spatial_only_scope` | `2.114932` | **`-16.20%`** | **`-14.44%`** | **`-16.59%`** | **`-14.22%`** | `-14.69%` | `-12.22%` |
+| `wo_ctu_delta_qp` | `3.136038` | `-8.03%` | `-11.55%` | `+5.88%` | `+0.51%` | **`-15.96%`** | **`-13.62%`** |
+| `iwa_gop_qp_reuse` | `3.117673` | `-12.54%` | `-13.85%` | `+19.71%` | `+16.94%` | `-15.09%` | `-11.47%` |
+| `proxy_only_zhao` | `1.959265` | `-8.34%` | `-8.79%` | `+7.61%` | `+7.07%` | `-6.97%` | `-7.19%` |
 
-**Nhận xét kỹ thuật:**
-- **Hiệu quả của huấn luyện STE với `libx265` thật:** `proxy_only_zhao` (chỉ huấn luyện qua proxy khả vi, không có `libx265` thật trong forward) bị lệch ở ngưỡng `AP@50` (`+0.25%` Total BDBR), trong khi `wo_ctu_delta_qp` (bật `libx265` STE + nhất quán thời gian) đạt `-3.01%` Total BDBR (`AP@50`) và `-5.71%` (`AP@[.50:.95]`).
-- **Hiệu quả của phân bổ QG/ROI (`addroi`):** Bật điều phối QG (`full_tscope`) nâng mức tiết kiệm BDBR (`AP@50`) từ `-3.01%` lên **`-7.10%`** (tăng `+1.51%` điểm `AP@50` tại `CRF 27` và `+2.48%` tại `CRF 37` so với `anchor_x265`).
-- **Hiệu quả vượt trội của `iwa_gop_qp_reuse`:** Giữ cố định bản đồ QG của I-frame cho toàn bộ mini-GOP 4 frame giúp tránh biến thiên lượng tử hóa giữa các P-frame liên tiếp, đạt mức tiết kiệm tốt nhất trên toàn bộ 4 chỉ số: **`-9.32%` Total BDBR (`AP@50`)**, **`-9.00%` P-Frame BDBR (`AP@50`)**, **`-8.66%` Total BDBR (`AP@[.50:.95]`)**, và **`-8.06%` P-Frame BDBR (`AP@[.50:.95]`)**.
+Đồ thị đường cong & ablation: [`docs/figures/fig_bdbr_curves.png`](./docs/figures/fig_bdbr_curves.png), [`docs/figures/fig_ablation_bdbr.png`](./docs/figures/fig_ablation_bdbr.png), [`docs/figures/ablation_preedit_comparison_grid.png`](./docs/figures/ablation_preedit_comparison_grid.png).
 
-### 5.3. Độ phức tạp Tính toán & Tốc độ Mã hóa Thực tế (`Table IV`)
+### 5.3. Phân rã Theo Chuỗi (`MOT17-11` Camera Cầm tay vs `MOT17-13` Camera Xe buýt Di chuyển Nhanh)
 
-Nguồn: `complexity_fps_report.json` (đo trực tiếp trên `TemporalSCOPE` và `libx265 -preset medium`).
+| Sequence (Frames) | Biến thể / Phương pháp | Total FRCNN AP@50 | Total FRCNN AP@50:95 | P-BPP FRCNN AP@50 | P-BPP FRCNN AP@50:95 | Total YOLO AP@50 | Total YOLO AP@50:95 |
+|---|---|---:|---:|---:|---:|---:|---:|
+| `MOT17-11` (`900`) | `full_tscope` | `-34.43%` | **`-17.31%`** | `-22.50%` | `+5.55%` | `-25.33%` | **`-24.35%`** |
+| `MOT17-11` (`900`) | `spatial_only_scope` | `-34.70%` | `-15.11%` | `-40.17%` | `-14.93%` | `+30.47%` | `-16.11%` |
+| `MOT17-11` (`900`) | `wo_ctu_delta_qp` | `-23.66%` | `-22.97%` | `-20.57%` | `-19.15%` | `-28.42%` | `-27.34%` |
+| `MOT17-11` (`900`) | `iwa_gop_qp_reuse` | `-28.57%` | `-21.49%` | `-15.35%` | `-3.39%` | `-31.76%` | `-27.80%` |
+| `MOT17-11` (`900`) | `proxy_only_zhao` | `-26.96%` | `-9.29%` | `-23.31%` | `+2.39%` | `-32.12%` | `-22.86%` |
+| `MOT17-11` (`900`) | `oracle_gt_mask_upper_bound` | `-47.01%` | `-41.59%` | `-44.07%` | `-36.38%` | `-13.13%` | `-43.51%` |
+| `MOT17-13` (`748`) | `full_tscope` | `-4.07%` | `-0.22%` | `+64.41%` | `+72.02%` | `-1.93%` | `-0.33%` |
+| `MOT17-13` (`748`) | `spatial_only_scope` | **`-8.17%`** | **`-7.17%`** | **`-4.50%`** | **`-3.05%`** | **`-10.87%`** | **`-8.15%`** |
+| `MOT17-13` (`748`) | `wo_ctu_delta_qp` | `+5.73%` | `+4.86%` | `+38.80%` | `+36.88%` | `-4.50%` | `-3.85%` |
+| `MOT17-13` (`748`) | `iwa_gop_qp_reuse` | `-3.08%` | `-2.11%` | `+57.61%` | `+58.90%` | `+0.03%` | `-2.08%` |
+| `MOT17-13` (`748`) | `proxy_only_zhao` | `-0.82%` | `-0.33%` | `+30.09%` | `+30.72%` | `-0.17%` | `+2.10%` |
+| `MOT17-13` (`748`) | `oracle_gt_mask_upper_bound` | `-52.64%` | `-52.08%` | `-47.46%` | `-46.80%` | `-46.33%` | `-45.37%` |
 
-| Mô hình / Cấu hình | Tổng Tham số (`M`) | Tham số Active (`M`) | GMACs / Frame (`256×256`) | GFLOPs / Frame (`256×256`) | Thời gian Mã hóa `libx265` (`ms/frame`) | Tốc độ Mã hóa `libx265` (`FPS`) |
-| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
-| Detector Tham chiếu (`fasterrcnn_resnet50_fpn_v2`) | `43.7123 M` | `43.7123 M` | — | — | — | — |
-| `anchor_x265` (Không tiền xử lý) | `0.0000 M` | `0.0000 M` | `0.00` | `0.00` | `23.41 ms` | `42.71 FPS` |
-| `spatial_only_scope` (`disable_temporal=True`) | `3.8034 M` | `1.8122 M` | `31.3221` | `62.6442` | `23.90 ms` (`+2.06%`) | `41.85 FPS` |
-| `wo_ctu_delta_qp` / `proxy_only_zhao` | `3.8034 M` | `3.8034 M` | `31.3433` | `62.6866` | `23.69 ms` (`+1.17%`) | `42.22 FPS` |
-| `iwa_gop_qp_reuse` (Tái sử dụng QG I-frame) | `3.8034 M` | `3.8034 M` | `31.3433` | `62.6866` | `24.33 ms` (`+3.91%`) | `41.10 FPS` |
-| **`full_tscope` (Đầy đủ QG mỗi frame)** | **`3.8034 M`** *(8.7% detector)* | **`3.8034 M`** | **`31.3433`** | **`62.6866`** | **`24.48 ms` (`+4.56%`)** | **`40.85 FPS`** |
+- **Điểm nghẽn v1 trên `MOT17-13`:** Khi camera lia nhanh, hiệu liên khung `I_t - I_{t-1}` chưa bù chuyển động gây ghosting/làm phình `bg_attn`, kéo giảm `ROI PSNR` (`28.33 dB` vs `32.95 dB` ở CRF 22) và làm phình P-frame BDBR (`+72.02%` ở `FRCNN AP50:95`). Hướng nâng cấp v2 được phát triển riêng tại `wagur1/tscope-v2`.
 
-### 5.4. Kết quả Nâng cấp Độ phân giải `512×512` + Lưới ROI `16×16` + Dải `qoffset ∈ [-0.18, +0.14]` + $\Delta\text{QP}$ Bất đối xứng
+### 5.4. Độ phức tạp Tính toán & Tốc độ Mã hóa Thực tế (`outputs_kaggle_pool/complexity_fps_report.json`)
 
-Nguồn: [`outputs_kaggle_pool/benchmark_512x512_16x16roi.json`](./outputs_kaggle_pool/benchmark_512x512_16x16roi.json) (đo trên các clip held-out `MOT17-11` và `MOT17-13` tại `CRF = [22, 27, 32, 37]`). Khi nâng độ phân giải từ `256×256` lên **`512×512`**, mở lưới `ffmpeg addroi` từ `8×8` lên **`16×16` vùng** (`32×32 px`/ô có gộp run-length ngang), mở rộng dải `qoffset` lên **`[-0.18, +0.14]`** (`+7.14 QP` ở vùng nền), và áp dụng phân bổ $\Delta\text{QP}$ bất đối xứng tiền cảnh/hậu cảnh, mức tiết kiệm BDBR tăng vọt gấp **2.5× – 3.1×**:
-
-| Phương pháp (`512×512`, `16×16` ROI, `qoffset ∈ [-0.18, +0.14]`) | Total BDBR (`GT AP@50`) | P-Frame BDBR (`GT AP@50`) | Total BDBR (`GT AP@[.50:.95]`) | P-Frame BDBR (`GT AP@[.50:.95]`) | Total BPP (`CRF 22 / 27 / 32 / 37`) | `GT AP@50` (`CRF 22 / 27 / 32 / 37`) |
-| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
-| `anchor_x265` (Trực tiếp `libx265` ở `512×512`) | `+0.00%` | `+0.00%` | `+0.00%` | `+0.00%` | `0.6258 / 0.3199 / 0.1569 / 0.0755` | `53.85% / 45.43% / 37.91% / 26.08%` |
-| **`full_tscope` (T-SCOPE per-frame `16×16` QG offsets)** | **`-22.35%`** | **`-19.53%`** | **`-17.68%`** | **`-12.71%`** | **`0.3126 / 0.1582 / 0.0780 / 0.0404`** | **`49.86% / 39.65% / 32.27% / 13.39%`** |
-| **`iwa_gop_qp_reuse` (T-SCOPE tái sử dụng QG từ I-frame)** | **`-23.57%`** | **`-21.10%`** | **`-24.44%`** | **`-22.02%`** | `0.6755 / 0.3543 / 0.1799 / 0.0888` | **`56.28% / 51.77% / 41.62% / 32.71%`** |
-| `oracle_gt_mask_upper_bound` (Cận trên, dùng GT) | **`-58.32%`** | **`-51.77%`** | **`-58.11%`** | **`-50.60%`** | `0.1650 / 0.0882 / 0.0469 / 0.0262` | `49.91% / 41.59% / 32.41% / 14.10%` |
-
-- Tại **cùng mức bitrate `~0.31 bpp`**, `full_tscope` ở `CRF 22` (`0.3126 bpp`, `AP@50 = 49.86%`) vượt `anchor_x265` ở `CRF 27` (`0.3199 bpp`, `AP@50 = 45.43%`) tới **`+4.43%` điểm AP@50** và **`+1.94%` điểm AP@[.50:.95]**.
-- Tại **cùng mức bitrate `~0.077 bpp`**, `full_tscope` ở `CRF 32` (`0.0780 bpp`, `AP@50 = 32.27%`) vượt `anchor_x265` ở `CRF 37` (`0.0755 bpp`, `AP@50 = 26.08%`) tới **`+6.19%` điểm AP@50**.
-- Hiện tại 12/21 tài khoản Kaggle còn quota GPU (`131.57h` GPU khả dụng) đang chạy huấn luyện hội tụ ở `512×512` với giám sát kép **Faster R-CNN ResNet50-FPN v2 + YOLOv8s** (`--use_yolov8s`).
-
-### 5.5. Kiểm định Gate 0 (Can thiệp nhân quả, 5/5 PASS) & Đa Detector Pilot
-
-Chi tiết kiểm định can thiệp Gate 0 (`G0.1..G0.5`) lưu tại [`outputs_rigor_gate0_gate1/rigor_gate0_gate1_report.json`](./outputs_rigor_gate0_gate1/rigor_gate0_gate1_report.json) và pilot đa detector lưu tại [`outputs_rigor_gate0_gate1/cross_backbone_bdbr.json`](./outputs_rigor_gate0_gate1/cross_backbone_bdbr.json).
-
-
+| Mô hình / Cấu hình | Tổng Tham số (`M`) | Active (`M`) | GMACs (`256×256`) | GMACs (`512×512`) | Thời gian `libx265` (`ms/frame`) | Tốc độ `libx265` (`FPS`) |
+|---|---:|---:|---:|---:|---:|---:|
+| Detector (`fasterrcnn_resnet50_fpn_v2`) | `43.7123` | `43.7123` | — | — | — | — |
+| `anchor_x265` | `0.0000` | `0.0000` | `0.00` | `0.00` | `23.41 ms` | `42.71 FPS` |
+| `spatial_only_scope` | `3.8034` | `1.8122` | `31.3221` | `125.2881` | `23.90 ms` (`+2.06%`) | `41.85 FPS` |
+| `wo_ctu_delta_qp` / `proxy_only_zhao` | `3.8034` | `3.8034` | `31.3433` | `125.3731` | `23.69 ms` (`+1.17%`) | `42.22 FPS` |
+| `iwa_gop_qp_reuse` | `3.8034` | `3.8034` | `31.3433` | `125.3731` | `24.33 ms` (`+3.91%`) | `41.10 FPS` |
+| `full_tscope` | `3.8034` | `3.8034` | `31.3433` | `125.3731` | `24.48 ms` (`+4.56%`) | `40.85 FPS` |
 
 ---
 
