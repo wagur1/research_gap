@@ -27,7 +27,7 @@ Từ bảng phân tích trên, chúng ta đề xuất **T-SCOPE (*Temporally-Con
 *Hình 1: Sơ đồ kiến trúc tổng quan của T-SCOPE theo tiêu chuẩn bài báo IEEE TCSVT / TIP (Vector PDF: [`docs/figures/fig_pipeline_overview.pdf`](docs/figures/fig_pipeline_overview.pdf)). Pipeline gồm 5 khối chức năng chính: (1) Nhập chuỗi video và vector điều kiện hóa nén $c_t$; (2) Mạng U-Net TemporalSCOPE điều biến FiLM với ConvGRU Bottleneck và tiền biên tập 2 nhánh; (3) Phân phối $\Delta\text{QP}$ CTU bất đối xứng qua FFmpeg `addroi` 16×16; (4) Vòng lặp nén HEVC `libx265` chuẩn với đạo hàm ngược qua STE Proxy; (5) Giám sát tác vụ đa bộ dò hạ nguồn (Faster R-CNN v2 + YOLOv8s).*
 
 ```
-Input Video {I_t} ──► [TemporalSCOPE (3.80M params, ConvGRU + FiLM)]
+Input Video {I_t} ──► [TemporalSCOPE (6.11M params, ConvGRU + FiLM)]
                              │
                              ├──► 1. Pre-edited Video {I_edit,t} (Bảo toàn vật thể + Khóa tĩnh nền liên khung)
                              │
@@ -81,7 +81,7 @@ Kế thừa tư tưởng của **WA-RDO** nhưng thực thi trực tiếp qua gi
   $$\hat{I}_t = \hat{I}_{\text{proxy}, t} + \text{stop\_grad}\big(\hat{I}_{\text{x265}, t} - \hat{I}_{\text{proxy}, t}\big)$$
 
 ### 2.5. Hàm Mục tiêu 5 Thành phần Đa Detector (`VCMTemporalPreEditLoss` — Faster R-CNN FPN + YOLOv8s CSPDarknet)
-Chỉ huấn luyện duy nhất mạng `TemporalSCOPE` (**3.80M tham số**), giữ đóng băng hoàn toàn cả hai mạng Detector (**Faster R-CNN ResNet50-FPN v2** двух-stage và **YOLOv8s** one-stage anchor-free):
+Chỉ huấn luyện duy nhất mạng `TemporalSCOPE` (**6.11M tham số**), giữ đóng băng hoàn toàn cả hai mạng Detector (**Faster R-CNN ResNet50-FPN v2** двух-stage và **YOLOv8s** one-stage anchor-free):
 
 $$\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{task}} + \mathcal{L}_{\text{att}} + \mathcal{L}_{\text{bg}} + \mathcal{L}_{\text{temp}} + \mathcal{L}_{\text{reg}}$$
 
@@ -100,7 +100,7 @@ $$\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{task}} + \mathcal{L}_{\text{at
 ```text
 ├── TCSVT_Paper_Blueprint.md          # Đề cương chi tiết bài báo IEEE TCSVT & bảng biểu thực nghiệm
 ├── models/
-│   └── temporal_scope.py             # Mạng TemporalSCOPE (3.80M params), FiLM, ConvGRU, CTU Delta-QP
+│   └── temporal_scope.py             # Mạng TemporalSCOPE (6.11M params), FiLM, ConvGRU, CTU Delta-QP
 ├── video_codecs/
 │   └── hybrid_x265_ste.py            # DifferentiableVideoProxy (Intra/Inter DCT) & HybridX265STE
 ├── losses/
@@ -171,7 +171,6 @@ VARIANT = "full_tscope"  # Hoặc: spatial_only_scope | wo_ctu_delta_qp | iwa_go
 
 ---
 
-
 ## 5. Kết quả Thực nghiệm Đóng gói v1 (`512×512`, `libx265` + `ffprobe` + 1.648 Frame Held-Out)
 
 > **Báo cáo đầy đủ:** [`docs/V1_PRELIMINARY_BENCHMARK_REPORT.md`](./docs/V1_PRELIMINARY_BENCHMARK_REPORT.md) | **Dữ liệu gốc hợp lệ (`final_ready=true`, `105/105` JSON):** [`outputs_kaggle_pool/merged_benchmarks.json`](./outputs_kaggle_pool/merged_benchmarks.json)
@@ -229,16 +228,6 @@ VARIANT = "full_tscope"  # Hoặc: spatial_only_scope | wo_ctu_delta_qp | iwa_go
 
 - **Điểm nghẽn v1 trên `MOT17-13`:** Khi camera lia nhanh, hiệu liên khung `I_t - I_{t-1}` chưa bù chuyển động gây ghosting/làm phình `bg_attn`, kéo giảm `ROI PSNR` (`28.33 dB` vs `32.95 dB` ở CRF 22) và làm tăng dư liên khung trên camera di chuyển. Hướng nâng cấp v2 được phát triển riêng tại `wagur1/tscope-v2`.
 
-### 5.4. Độ phức tạp Tính toán & Tốc độ Mã hóa Thực tế (`outputs_kaggle_pool/complexity_fps_report.json`)
-
-| Mô hình / Cấu hình | Tổng Tham số (`M`) | Active (`M`) | GMACs (`256×256`) | GMACs (`512×512`) | Thời gian `libx265` (`ms/frame`) | Tốc độ `libx265` (`FPS`) |
-|---|---:|---:|---:|---:|---:|---:|
-| Detector (`fasterrcnn_resnet50_fpn_v2`) | `43.7123` | `43.7123` | — | — | — | — |
-| `anchor_x265` | `0.0000` | `0.0000` | `0.00` | `0.00` | `23.41 ms` | `42.71 FPS` |
-| `spatial_only_scope` | `3.8034` | `1.8122` | `31.3221` | `125.2881` | `23.90 ms` (`+2.06%`) | `41.85 FPS` |
-| `wo_ctu_delta_qp` / `proxy_only_zhao` | `3.8034` | `3.8034` | `31.3433` | `125.3731` | `23.69 ms` (`+1.17%`) | `42.22 FPS` |
-| `iwa_gop_qp_reuse` | `3.8034` | `3.8034` | `31.3433` | `125.3731` | `24.33 ms` (`+3.91%`) | `41.10 FPS` |
-| `full_tscope` | `3.8034` | `3.8034` | `31.3433` | `125.3731` | `24.48 ms` (`+4.56%`) | `40.85 FPS` |
 ---
 
 ## 6. Ghi chú Hiệu năng GPU & Tùy chọn Tăng FPS (`512×512`)

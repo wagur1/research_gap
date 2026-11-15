@@ -102,10 +102,3 @@
 1. **Sụp đổ ở camera chuyển động nhanh (`MOT17-13`):** Trên `MOT17-11`, `full_tscope` vượt `spatial_only_scope` về `FRCNN AP50:95` (`-17.31%` vs `-15.11%`) và `YOLO AP50:95` (`-24.35%` vs `-16.11%`). Nhưng trên `MOT17-13` (xe buýt chạy, chiếm gần 1/2 số clip test), `full_tscope` gần như mất hết lợi thế (`-0.22%` FRCNN AP50:95, `+72.02%` P-BPP50:95), làm kéo tụt kết quả gộp toàn tập xuống sau `spatial_only_scope`.
 2. **Rò rỉ làm mờ lên tiền cảnh (`ROI PSNR` & `AP` giảm):** Ở CRF 22 trên toàn tập, `full_tscope` đạt `FRCNN AP50 = 54.02%` (`ROI PSNR = 28.33 dB`) so với `anchor_x265` `56.39%` (`32.95 dB`) và `spatial_scope_framewise` `56.66%` (`30.76 dB`). Trên trực quan [`ablation_preedit_comparison_grid.png`](./figures/ablation_preedit_comparison_grid.png), sai khác `|I_edit - I|` ở `full_tscope` vẫn sáng rõ trên người đi bộ tiền cảnh trong khi `spatial_only_scope` giữ nền đen bảo toàn người đi bộ. Nguyên nhân do `diff_t = I_t - I_{t-1}` toàn cục chưa căn chỉnh làm `bg_attn` phình lên khi camera lia (`0.222 -> 0.396`), `fg_attn` không bão hòa về `1.0`, và `bg_prev` EMA chưa bù chuyển động kéo bóng mờ chồng lên vật thể.
 3. **Bù bit I-frame đẩy sang P-frame & tụt `dqp` trên P-frame:** Khi nền nhấp nháy ở `MOT17-13`, `P-frame BPP` ở CRF 37 của `full_tscope` tăng lên `0.0184` so với `0.0165` của `anchor_x265` (tức dùng nhiều bit P-frame hơn mà AP lại thấp hơn: `18.01%` vs `22.11%`), dẫn đến `P-BPP BDBR = +72.02%` trên `MOT17-13` và `+25.52%` toàn tập. Ràng buộc phân bổ $\Delta\text{QP}$ và `P-frame BPP` cần được đưa trực tiếp vào hàm mất mát và cơ chế gating thời gian ở bản nâng cấp v2.
-
----
-
-## 4. Độ phức tạp và Tốc độ mã hóa ([`complexity_fps_report.json`](../outputs_kaggle_pool/complexity_fps_report.json))
-
-- **Tham số `TemporalSCOPE`:** `3.8034M` (`~8.7%` so với `Faster R-CNN ResNet50-FPN v2` `43.7123M`), `31.3433 GMACs` @ `256×256` (`125.3731 GMACs` @ `512×512`).
-- **Tốc độ `libx265` với CTU `addroi`:** `40.85 fps` (`24.48 ms/frame`, chênh `+4.56%` so với anchor `42.71 fps` / `23.41 ms/frame`).
