@@ -1,30 +1,30 @@
 # T-SCOPE: Temporally-Consistent Semantic Pre-Editing and CTU-Level Rate Allocation for Video Coding for Machines (`x265` / `VVenC`)
 
-Official PyTorch implementation, mathematical formulation, and 21-account Kaggle distributed sharding framework for **T-SCOPE** (targeted at **IEEE TCSVT / IEEE TIP**).
+Mã nguồn PyTorch, công thức toán và bộ chạy phân tán 21 tài khoản Kaggle cho **T-SCOPE** (hướng tới **IEEE TCSVT / IEEE TIP**).
 
 ---
 
-## 1. Phân tích các Paper SOTA và Lỗ hổng Nghiên cứu (Research Gaps)
+## 1. Tổng hợp các bài báo VCM liên quan
 
-Các nghiên cứu hiện tại về tiền xử lý (Pre-processing / Pre-editing) và tối ưu hóa Rate-Distortion trong **Video Coding for Machines (VCM)** đang gặp 3 nút thắt lớn khi ghép nối với bộ mã hóa video chuẩn như **HEVC (`x265`)** và **VVC (`VVenC`)**:
+Tiền xử lý video cho thị giác máy (VCM) trước các bộ mã hóa chuẩn như **HEVC (`x265`)** và **VVC (`VVenC`)** vẫn vướng 3 điểm nghẽn khi dùng ngoài thực tế:
 
-| # | Paper & Venue | Hướng tiếp cận & Cơ chế cốt lõi | Nhược điểm / Lỗ hổng kỹ thuật (Research Gap) |
+| # | Bài báo & hội nghị | Cách làm chính | Hạn chế còn lại |
 |---|---|---|---|
-| **1** | **A Preprocessing Framework for Video Machine Vision under Compression**<br>*(Fei Zhao et al., ByteDance & PKU — IEEE DCC 2024 / `arXiv:2512.15331`)* | - Đặt mạng tiền xử lý 2 nhánh (Spatial 2D Conv + Temporal 3D Conv) trước `x264`/`x265`.<br>- Dùng *Differentiable Virtual Video Codec* (tìm kiếm khung $t-1$, lượng tử hóa $f_q \in [30, 50]$, entropy Ballé) khi huấn luyện.<br>- Hàm mục tiêu: $\mathcal{L} = \alpha(\mathcal{L}_D + \lambda \mathcal{L}_R) + \mathcal{L}_{\text{Acc}}$ với $\mathcal{L}_D = \text{MSE}(X, \hat{X})$. Giảm $\sim 16.2\%$ BD-Rate trên `x265`. | 1. **Mâu thuẫn hàm mục tiêu:** Phạt $\text{MSE}(X, \hat{X})$ trên toàn bộ khung hình buộc bộ tiền xử lý phải giữ lại cả chi tiết vùng nền vô ích, đi ngược lại lý thuyết Information Bottleneck.<br>2. **Codec Mismatch:** Chỉ huấn luyện với *Virtual Codec* mà không có `x265` thật trong vòng lặp forward, gây lệch nghiêm trọng ở bitrate thấp.<br>3. **Thiếu điều kiện hóa (Unconditioned):** Phải huấn luyện 10 mô hình riêng biệt cho 10 mạng backbone và chỉ kiểm thử trên tác vụ thô (Action Recognition, Single-Object Tracking), chưa giải quyết bài toán Dense Video Detection / Multi-Object Tracking (MOT). |
-| **2** | **SCOPE: Semantic COdec Pre-Editing for Object-Preserving Compression**<br>*(Silvia Dani, Leonardo Galteri, Marco Bertini — `arXiv:2610.39778`, 2026)* | - Tiền biên tập ảnh có điều kiện theo họ codec và mức độ nén $(f, s)$ qua lớp FiLM.<br>- Tách 2 nhánh bất đối xứng: giữ chi tiết vật thể $I_{\text{obj}} = \text{clip}(I + \Delta_{\text{obj}})$ và làm phẳng nền $I_{\text{bg}} = \text{clip}(\text{Blur}(I) + \Delta_{\text{bg}})$, trộn qua bản đồ chú ý $A$: $I_{\text{edit}} = A \odot I_{\text{obj}} + (1 - A) \odot I_{\text{bg}}$.<br>- Chỉ cần giám sát từ mask GT và FPN của Faster R-CNN đóng băng lúc train; lúc suy luận chạy độc lập đạt 84.7 FPS, giảm $21.74\%$ BDBR trên BPG. | 1. **Mù thời gian (Spatial-Only):** Xử lý từng khung hình độc lập. Khi áp dụng lên chuỗi video trước `x265` (cấu trúc IPPP/IBBP), bản đồ chú ý $A_t$ và phần dư $\Delta_{\text{obj}, t}, \Delta_{\text{bg}, t}$ biến thiên hỗn loạn giữa frame $t-1$ và $t$.<br>2. **Phá vỡ dự đoán liên khung (Inter-prediction):** Nhiễu nhấp nháy theo thời gian làm bộ ước lượng chuyển động (Motion Estimation) của `x265` không tìm được khối khớp, đẩy bit của Motion Vector Difference (MVD) và phần dư P/B-frame tăng vọt, thậm chí ép `x265` phải chuyển sang chế độ Intra-CU tốn bit.<br>3. **Lãng phí bản đồ chú ý $A$:** Dự đoán được vùng vật thể quan trọng $A \in [0, 1]^{H\times W}$ nhưng vứt bỏ sau bước trộn pixel thay vì truyền vào bộ điều khiển lượng tử của encoder. |
-| **3** | **Task-Switchable Pre-Processor for Image Compression for Multiple Machine Vision Tasks (TSW-Pre)**<br>*(Mingyi Yang et al. — IEEE TCSVT, Vol. 34, No. 7, 2024)* | - Dùng một mạng U-Net dùng chung kết hợp với $K$ bộ điều biến ngữ nghĩa chuyên biệt theo tác vụ (*Task-Attentive Semantic Modulation - TSM*) dùng lớp Spatial Feature Transform (SFT).<br>- Tối ưu kết hợp Rate-Task Loss và FPN Feature Distillation ($\mathcal{L}_{\text{dist}}$). Giảm $32.63\%$ BD-BR khi chuyển giao sang BPG trên COCO Detection. | 1. **Chi phí tính toán cực nặng ở Encoder:** Để tạo đặc trưng ngữ nghĩa $\psi_i$ đưa vào lớp SFT, bộ tiền xử lý bắt buộc phải chạy một mạng **ResNeXt-101** ngay ở đầu vào trong **mọi lần suy luận (inference)** — không khả thi cho mã hóa video thời gian thực ở thiết bị biên.<br>2. **Không thích ứng theo QP và thời gian:** Chỉ thiết kế cho ảnh tĩnh và không điều biến theo mức lượng tử hóa (QP) của bộ mã hóa. |
-| **4** | **Preprocessing Enhanced Image Compression for Machine Vision**<br>*(Guo Lu et al. — IEEE TCSVT, Vol. 34, No. 12, 2024 / `arXiv:2206.05650`)* | - Kiến trúc 2 nhánh song song ($1\times 1$ Conv + U-Net) tích hợp *Quantization Adaptation Layer (QAL)* nhận trực tiếp `QP` của codec chuẩn.<br>- **Cơ chế Hybrid Forward-Codec / Backward-Proxy:** Chiều forward chạy BPG thật để lấy ảnh giải mã $\hat{X}$ và bitrate thật $R_t$; chiều backward truyền đạo hàm qua mạng proxy Minnen ($\hat{Y}, R_p$). Giảm $20.3\%$ BDBR trên BPG. | 1. Chỉ hỗ trợ nén Intra trên ảnh tĩnh (BPG / JPEG), không mô hình hóa được dự đoán liên khung (Inter-frame residual) của video.<br>2. Ràng buộc $\mathcal{D}_{\text{pre}} = d(X, \bar{X})$ với hệ số $\beta = 0.5$ trên toàn khung hình ngăn cản mạng xóa triệt để thông tin thừa ở vùng nền như cơ chế tách nhánh của SCOPE. |
-| **5** | **Wrapper-Aware Rate-Distortion Optimization in Feature Coding for Machines (WA-RDO)**<br>*(S. Fernández-Menduiña et al., USC & InterDigital — IEEE ICASSP 2026)* | - Trong kiến trúc Feature Coding (MPEG FCTM), thay thế SSE-RDO của codec chuẩn (AVC/HEVC) bằng hàm lỗi bình phương có trọng số dựa trên phác thảo ma trận Jacobian $h(z) = \text{diag}(J_s(z)^\top J_s(z))$.<br>- **IWA-RDO:** Chỉ tính bản đồ quan trọng ở I-frame và tái sử dụng cho các P/B-frame trong cùng GOP, giúp HEVC đạt hiệu năng ngang VVC và giảm $28.13\%$ thời gian mã hóa. | 1. Chỉ áp dụng cho **Feature Coding (FCM)** (nén các bản đồ đặc trưng đã đóng gói thành khung 2D), chưa khai thác cho **Pixel-domain Video Pre-processing**.<br>2. Việc giữ cố định bản đồ trọng số của I-frame cho toàn bộ GOP (IWA-RDO) sẽ bị lệch không gian khi vật thể di chuyển nhanh ở các frame cuối GOP. |
-| **6** | **Rate-Accuracy Bounds in Visual Coding for Machines**<br>*(Ivan V. Bajić — IEEE MIPR 2025 / `arXiv:2505.14980`)* | - Thiết lập cận lý thuyết Rate-Accuracy (RA) bằng cách mô hình hóa bài toán thị giác máy như mã hóa nguồn rời rạc không nhớ (DMS) $K$ ký hiệu dưới độ méo Hamming: $R(D_H) \approx A \log_2(K)$.<br>- Chứng minh các hệ thống VCM SOTA hiện tại trên ImageNet ($K=1000$) và COCO Detection còn cách cận lý thuyết từ **$100\times$ đến $1000\times$ về bitrate**. | - Bài báo thuần lý thuyết.<br>- Chỉ ra nguyên lý cốt lõi thông qua **Data Processing Inequality (DPI)**: để tiến gần cận lý thuyết, bộ tiền xử lý bắt buộc phải loại bỏ tối đa thông tin tương hỗ (mutual information) không liên quan đến tác vụ ở cả chiều không gian và chiều thời gian, đồng thời chưng cất đặc trưng ở các tầng sâu (deep FPN layers). |
+| **1** | **A Preprocessing Framework for Video Machine Vision under Compression**<br>*(Fei Zhao et al., ByteDance & PKU, IEEE DCC 2024 / `arXiv:2512.15331`)* | - Chạy mạng tiền xử lý 2 nhánh (Spatial 2D Conv + Temporal 3D Conv) trước `x264`/`x265`.<br>- Dùng *Differentiable Virtual Video Codec* (tìm khớp khung $t-1$, lượng tử hóa $f_q \in [30, 50]$, entropy Ballé) khi train.<br>- Tối ưu $\mathcal{L} = \alpha(\mathcal{L}_D + \lambda \mathcal{L}_R) + \mathcal{L}_{\text{Acc}}$ với $\mathcal{L}_D = \text{MSE}(X, \hat{X})$, giảm khoảng $16.2\%$ BD-Rate trên `x265`. | 1. Phạt $\text{MSE}(X, \hat{X})$ trên toàn khung hình nên mạng phải giữ cả chi tiết nền thừa, ngược nguyên lý Information Bottleneck.<br>2. Chỉ train qua *Virtual Codec* mà không có `x265` thật ở lượt forward nên kết quả lệch mạnh ở bitrate thấp.<br>3. Thiếu điều kiện hóa nên phải train 10 model riêng cho 10 backbone, mới thử trên tác vụ thô (Action Recognition, Single-Object Tracking), chưa xử lý Dense Video Detection hay Multi-Object Tracking (MOT). |
+| **2** | **SCOPE: Semantic COdec Pre-Editing for Object-Preserving Compression**<br>*(Silvia Dani, Leonardo Galteri, Marco Bertini, `arXiv:2610.39778`, 2026)* | - Tiền biên tập theo họ codec và mức nén $(f, s)$ qua lớp FiLM.<br>- Tách 2 nhánh: giữ nét vật thể $I_{\text{obj}} = \text{clip}(I + \Delta_{\text{obj}})$, làm phẳng nền $I_{\text{bg}} = \text{clip}(\text{Blur}(I) + \Delta_{\text{bg}})$, rồi trộn qua bản đồ chú ý $A$ bằng $I_{\text{edit}} = A \odot I_{\text{obj}} + (1 - A) \odot I_{\text{bg}}$.<br>- Dùng nhãn mask GT và FPN của Faster R-CNN đóng băng lúc train; suy luận chạy độc lập đạt 84.7 FPS, giảm $21.74\%$ BDBR trên BPG. | 1. Xử lý từng khung hình rời rạc nên khi ghép trước `x265` (cấu trúc IPPP/IBBP), bản đồ chú ý $A_t$ và phần dư $\Delta_{\text{obj}, t}, \Delta_{\text{bg}, t}$ rung lắc giữa frame $t-1$ và $t$.<br>2. Nhiễu nhấp nháy phá dự đoán liên khung (Inter-prediction), khiến Motion Estimation của `x265` khó khớp khối, đẩy bit MVD và phần dư P/B-frame tăng mạnh, thậm chí ép CU chuyển sang Intra.<br>3. Tính ra bản đồ chú ý $A \in [0, 1]^{H\times W}$ rồi bỏ luôn sau bước trộn pixel, không đưa tiếp xuống bộ điều khiển lượng tử của encoder. |
+| **3** | **Task-Switchable Pre-Processor for Image Compression for Multiple Machine Vision Tasks (TSW-Pre)**<br>*(Mingyi Yang et al., IEEE TCSVT, Vol. 34, No. 7, 2024)* | - Dùng chung một U-Net kèm $K$ bộ điều biến theo tác vụ (*Task-Attentive Semantic Modulation - TSM*) qua lớp Spatial Feature Transform (SFT).<br>- Phối hợp Rate-Task Loss và chưng cất FPN ($\mathcal{L}_{\text{dist}}$), giảm $32.63\%$ BD-BR khi sang BPG trên COCO Detection. | 1. Phải chạy nguyên mạng **ResNeXt-101** ngay đầu vào trong mọi lần inference để sinh đặc trưng $\psi_i$ cho SFT, quá nặng nếu chạy video thời gian thực ở biên.<br>2. Thiết kế cho ảnh tĩnh, chưa điều biến theo mức QP hay theo trục thời gian. |
+| **4** | **Preprocessing Enhanced Image Compression for Machine Vision**<br>*(Guo Lu et al., IEEE TCSVT, Vol. 34, No. 12, 2024 / `arXiv:2206.05650`)* | - Ghép 2 nhánh song song ($1\times 1$ Conv + U-Net) với *Quantization Adaptation Layer (QAL)* nhận trực tiếp `QP` của codec chuẩn.<br>- Chiều forward chạy BPG thật để lấy ảnh giải mã $\hat{X}$ và bitrate thật $R_t$; chiều backward truyền đạo hàm qua mạng proxy Minnen ($\hat{Y}, R_p$), giảm $20.3\%$ BDBR trên BPG. | 1. Mới chạy nén Intra cho ảnh tĩnh (BPG / JPEG), chưa mô phỏng dự đoán liên khung của video.<br>2. Phạt $\mathcal{D}_{\text{pre}} = d(X, \bar{X})$ với hệ số $\beta = 0.5$ trên toàn khung hình nên không dọn sạch nền bằng cơ chế tách 2 nhánh của SCOPE. |
+| **5** | **Wrapper-Aware Rate-Distortion Optimization in Feature Coding for Machines (WA-RDO)**<br>*(S. Fernández-Menduiña et al., USC & InterDigital, IEEE ICASSP 2026)* | - Trong Feature Coding (MPEG FCTM), thay SSE-RDO của AVC/HEVC bằng sai số bình phương có trọng số từ đường chéo Jacobian $h(z) = \text{diag}(J_s(z)^\top J_s(z))$.<br>- Chế độ IWA-RDO chỉ tính bản đồ trọng số ở I-frame rồi dùng chung cho P/B-frame trong cùng GOP, đưa hiệu năng HEVC ngang VVC và giảm $28.13\%$ thời gian mã hóa. | 1. Áp dụng cho Feature Coding (FCM, nén bản đồ đặc trưng đóng gói thành khung 2D), chưa làm ở miền pixel cho video.<br>2. Khóa cứng bản đồ trọng số từ I-frame cho cả GOP làm sai lệch vị trí khi vật thể đi nhanh ở các frame sau. |
+| **6** | **Rate-Accuracy Bounds in Visual Coding for Machines**<br>*(Ivan V. Bajić, IEEE MIPR 2025 / `arXiv:2505.14980`)* | - Dựng cận lý thuyết Rate-Accuracy (RA) bằng mô hình hóa thị giác máy như nguồn rời rạc không nhớ (DMS) $K$ ký hiệu dưới độ méo Hamming: $R(D_H) \approx A \log_2(K)$.<br>- Chứng minh hệ thống VCM SOTA trên ImageNet ($K=1000$) và COCO Detection còn cách cận lý thuyết từ $100\times$ đến $1000\times$ về bitrate. | - Là công trình lý thuyết thuần túy.<br>- Rút ra từ Data Processing Inequality (DPI) rằng bộ tiền xử lý cần lọc bớt tối đa thông tin thừa ở cả không gian lẫn thời gian và chưng cất đặc trưng tại các tầng FPN sâu. |
 
 ---
 
-## 2. Phương pháp Đề xuất: T-SCOPE (Đóng góp Cốt lõi của Chúng ta)
+## 2. Kiến trúc và thuật toán T-SCOPE
 
-Từ bảng phân tích trên, chúng ta đề xuất **T-SCOPE (*Temporally-Consistent Semantic Pre-Editing and CTU-Level Rate Allocation*)** — một khung tiền xử lý video tương thích hoàn toàn với bộ mã hóa chuẩn **`libx265` (HEVC)** (với cấu trúc mở rộng sang `VVenC` / VVC trong công việc tương lai), giải quyết đồng thời cả 3 nút thắt mà không cần gắn mạng backbone nặng ở bộ mã hóa. *(Lưu ý phạm vi `R11`: Các dẫn chiếu tới Data Processing Inequality / Information Bottleneck đóng vai trò nguyên lý định hướng thiết kế hàm mất mát, và thực nghiệm kiểm chứng trong kho mã nguồn này tập trung trên bộ mã hóa thực `libx265` qua `ffmpeg` + `ffprobe` + `addroi`)*:
+**T-SCOPE** (*Temporally-Consistent Semantic Pre-Editing and CTU-Level Rate Allocation*) tiền biên tập video ngay trước bộ mã hóa chuẩn **`libx265` (HEVC)**, còn giao diện điều kiện nén giữ sẵn phần mở rộng cho `VVenC` (VVC). Mô hình xử lý cả 3 nút thắt từ bảng trên mà không kẹp mạng backbone nặng phía encoder. Hai nguyên lý *Data Processing Inequality* và *Information Bottleneck* dùng để định hướng hàm mất mát; toàn bộ thực nghiệm trong kho mã này kiểm chứng trên `libx265` qua `ffmpeg`, `ffprobe` và `addroi` (giới hạn phạm vi `R11`).
 
 ![T-SCOPE System Overview Pipeline](docs/figures/fig_pipeline_overview.png)
-*Hình 1: Sơ đồ kiến trúc tổng quan của T-SCOPE theo tiêu chuẩn bài báo IEEE TCSVT / TIP (Vector PDF: [`docs/figures/fig_pipeline_overview.pdf`](docs/figures/fig_pipeline_overview.pdf)). Pipeline gồm 5 khối chức năng chính: (1) Nhập chuỗi video và vector điều kiện hóa nén $c_t$; (2) Mạng U-Net TemporalSCOPE điều biến FiLM với ConvGRU Bottleneck và tiền biên tập 2 nhánh; (3) Phân phối $\Delta\text{QP}$ CTU bất đối xứng qua FFmpeg `addroi` 16×16; (4) Vòng lặp nén HEVC `libx265` chuẩn với đạo hàm ngược qua STE Proxy; (5) Giám sát tác vụ đa bộ dò hạ nguồn (Faster R-CNN v2 + YOLOv8s).*
+*Hình 1: Kiến trúc T-SCOPE ([Vector PDF](docs/figures/fig_pipeline_overview.pdf)). Pipeline gồm 5 khối: (1) nhận chuỗi video kèm vector điều kiện $c_t$; (2) chạy U-Net `TemporalSCOPE` (ConvGRU + FiLM) tách nhánh tiền biên tập; (3) phân phối $\Delta\text{QP}$ CTU qua `ffmpeg addroi` 16×16; (4) nén `libx265` thật kèm đạo hàm ngược qua STE Proxy; (5) giám sát đa bộ dò Faster R-CNN v2 và YOLOv8s.*
 
 ```
 Input Video {I_t} ──► [TemporalSCOPE (6.11M params, ConvGRU + FiLM)]
@@ -37,68 +37,76 @@ Input Video {I_t} ──► [TemporalSCOPE (6.11M params, ConvGRU + FiLM)]
 Downstream Task (Faster R-CNN / YOLO / ByteTrack) ◄── Giải mã chuẩn ◄── Bộ mã hóa x265 / VVenC
 ```
 
-### 2.1. Điều kiện hóa Đa Họ Codec và Phi tuyến Mức độ Nén (`SeverityConditioner`)
-Thay vì huấn luyện một mô hình riêng cho từng mức QP hay từng bộ mã hóa như Zhao et al., T-SCOPE nhận cặp điều kiện $(f, s)$ với $f \in \{\text{x265}, \text{VVenC}, \text{x264}, \text{Intra}\}$ (nhúng qua $e_f \in \mathbb{R}^8$) và mức độ nén chuẩn hóa $s = \frac{\text{QP} - 22}{25} \in [0, 1]$ được khai triển qua cơ sở đa thức - bản lề 6 chiều:
+### 2.1. Điều kiện hóa theo họ codec và mức nén (`SeverityConditioner`)
+
+Thay vì train riêng từng model cho mỗi mức QP hay mỗi codec như Zhao et al., T-SCOPE nhận cặp $(f, s)$ gồm họ codec $f \in \{\text{x265}, \text{VVenC}, \text{x264}, \text{Intra}\}$ (nhúng qua $e_f \in \mathbb{R}^8$) và mức nén chuẩn hóa $s = \frac{\text{QP} - 22}{25} \in [0, 1]$. Giá trị $s$ trải qua 6 hàm cơ sở đa thức và bản lề:
 
 $$\phi(s) = \big[s, \, s^2, \, s^3, \, h_{0.50}(s), \, h_{0.75}(s), \, h_{0.90}(s)\big], \quad h_\tau(s) = \text{clip}\left(\frac{s - \tau}{1 - \tau}, 0, 1\right)$$
 
-Vector điều kiện $c = \text{MLP}([e_f, \phi(s)]) \in \mathbb{R}^{64}$ điều biến toàn bộ các tầng tích chập của mạng U-Net thông qua cơ chế Feature-wise Linear Modulation:
+Vector điều kiện $c = \text{MLP}([e_f, \phi(s)]) \in \mathbb{R}^{64}$ điều biến các lớp tích chập trong U-Net theo cơ chế Feature-wise Linear Modulation:
 
 $$\text{FiLM}(x, c) = x \odot (1 + \gamma(c)) + \beta(c)$$
 
-### 2.2. Tiền biên tập Bất đối xứng Nhất quán Thời gian (`TemporalConvGRU` & Motion-Gated Background Locking)
-Để ngăn chặn hiện tượng nhấp nháy liên khung (inter-frame flickering) làm hỏng Motion Estimation của `x265` mà không tốn chi phí tính Optical Flow:
-1. **Đầu vào nhận thức biến thiên thời gian:** Ghép kênh khung hình hiện tại $I_t$ và hiệu liên khung $I_t - I_{t-1}$ (6 kênh đầu vào).
-2. **Trạng thái ẩn Bottleneck ConvGRU (`TemporalConvGRUCell`):** Đặt tại độ phân giải cổ chai $H/4 \times W/4$:
+### 2.2. Tiền biên tập giữ ổn định thời gian (`TemporalConvGRU` & Motion-Gated Background Locking)
+
+Nhấp nháy giữa các khung hình làm bộ ước lượng chuyển động của `x265` khớp sai khối, còn chạy Optical Flow thì quá nặng. Nhánh thời gian giải quyết việc này qua 3 bước:
+
+1. Ghép 6 kênh đầu vào từ khung hình hiện tại $I_t$ và hiệu liên khung $I_t - I_{t-1}$ để mạng thấy phần vừa đổi giữa hai frame.
+2. Đặt khối `TemporalConvGRUCell` ở nút cổ chai $H/4 \times W/4$:
    $$H_t = \text{ConvGRU}(Z_t, H_{t-1})$$
-   giúp bản đồ chú ý vật thể $A_t \in [0, 1]^{1\times H\times W}$ và phần dư bảo vệ vật thể $\Delta_{\text{obj}, t} \in [-0.09, +0.09]^{3\times H\times W}$ dịch chuyển mượt dọc theo quỹ đạo chuyển động.
-3. **Nhánh nền khóa tĩnh có cổng chuyển động (Motion-Gated EMA Background Branch):**
-   - Nhánh vật thể giữ nguyên độ sắc nét biên:
-     $$I_{\text{obj}, t} = \text{clip}(I_t + \Delta_{\text{obj}, t}, 0, 1)$$
-   - Nhánh nền kết hợp làm mờ Gaussian $5\times 5$ trong không gian với trung bình trượt hàm mũ (EMA) theo thời gian được điều khiển bởi mặt nạ đứng yên $M_{\text{static}, t} = \exp(-15 \cdot \|I_t - I_{t-1}\|_1)$:
-     $$I_{\text{bg\_spatial}, t} = \text{clip}(\text{Blur}_{5\times 5}(I_t) + \Delta_{\text{bg}, t}, 0, 1), \quad \|\Delta_{\text{bg}, t}\|_\infty \le 0.03$$
-     $$I_{\text{bg}, t} = w_{\text{temp}, t} \odot I_{\text{bg}, t-1} + (1 - w_{\text{temp}, t}) \odot I_{\text{bg\_spatial}, t}$$
-   - Khi vùng nền đứng yên ($M_{\text{static}, t} \to 1$), $I_{\text{bg}, t}$ khóa chặt theo $I_{\text{bg}, t-1}$, triệt tiêu hoàn toàn nhiễu cảm biến giữa các frame và ép `x265` chọn chế độ **Skip/Merge CU** tốn gần 0 bit trên P/B-frames. Khi camera di chuyển ($M_{\text{static}, t} \to 0$), cổng tự động nhả về $I_{\text{bg\_spatial}, t}$ để không gây hiện tượng bóng ma (ghosting).
-   - Khung hình xuất ra:
-     $$I_{\text{edit}, t} = A_t \odot I_{\text{obj}, t} + (1 - A_t) \odot I_{\text{bg}, t}$$
+   Mạch hồi tiếp giữ cho bản đồ chú ý $A_t \in [0, 1]^{1\times H\times W}$ và phần dư vật thể $\Delta_{\text{obj}, t} \in [-0.09, +0.09]^{3\times H\times W}$ bám theo quỹ đạo di chuyển.
+3. Tách riêng nhánh giữ nét vật thể và nhánh làm phẳng nền theo thời gian:
+   $$I_{\text{obj}, t} = \text{clip}(I_t + \Delta_{\text{obj}, t}, 0, 1)$$
+   Nhánh nền kết hợp làm mờ Gaussian $5\times 5$ trong không gian với trung bình trượt EMA điều tiết bằng mặt nạ đứng yên $M_{\text{static}, t} = \exp(-15 \cdot \|I_t - I_{t-1}\|_1)$:
+   $$I_{\text{bg\_spatial}, t} = \text{clip}(\text{Blur}_{5\times 5}(I_t) + \Delta_{\text{bg}, t}, 0, 1), \quad \|\Delta_{\text{bg}, t}\|_\infty \le 0.03$$
+   $$I_{\text{bg}, t} = w_{\text{temp}, t} \odot I_{\text{bg}, t-1} + (1 - w_{\text{temp}, t}) \odot I_{\text{bg\_spatial}, t}$$
+   Tại vùng đứng yên ($M_{\text{static}, t} \to 1$), nền $I_{\text{bg}, t}$ bám chặt $I_{\text{bg}, t-1}$ để cắt nhiễu cảm biến và đưa `x265` về chế độ **Skip/Merge CU** gần như không tốn bit trên P/B-frame. Khi camera di chuyển ($M_{\text{static}, t} \to 0$), cổng thời gian nhả trọng số về $I_{\text{bg\_spatial}, t}$ để bớt kéo vệt mờ. Cuối cùng trộn hai nhánh qua $A_t$:
+   $$I_{\text{edit}, t} = A_t \odot I_{\text{obj}, t} + (1 - A_t) \odot I_{\text{bg}, t}$$
 
-### 2.3. Điều phối Lượng tử hóa Khối CTU $\Delta\text{QP}$ Bất đối xứng từ Bản đồ Chú ý (`compute_ctu_qp_offsets`)
-Kế thừa tư tưởng của **WA-RDO** nhưng thực thi trực tiếp qua giao diện chuẩn `x265_picture.quantOffsets` (`ffmpeg addroi`) trên lưới **`16×16` vùng** (`32×32 px`/ô ở `512×512`) mà không cần sửa đổi bitstream:
-- Thay vì vứt bỏ bản đồ chú ý $A_t$ sau khi trộn pixel như SCOPE, T-SCOPE hạ mẫu $A_t$ bằng Average Pooling xuống lưới nhóm lượng tử (Quantization Group kích thước $16\times 16$):
-  $$A_{t, (u,v)}^{\text{QG}} = \text{AvgPool}_{16\times 16}(A_t)_{(u,v)}$$
-- **Phân bổ $\Delta\text{QP}$ bất đối xứng tiền cảnh / hậu cảnh:** Vì người đi bộ trong MOT17 chỉ chiếm $10\%\text{–}20\%$ diện tích khung hình ($\bar{A}_t^{\text{QG}} \approx 0.15$), chuẩn hóa đối xứng zero-mean truyền thống làm vùng nền chỉ tăng tối đa $+2.5\text{ QP}$ (`qoffset` $\le +0.05$). T-SCOPE chuẩn hóa tách biệt hai nhánh tiền cảnh và hậu cảnh quanh $\bar{A}_t^{\text{QG}}$:
-  $$f_{t,(u,v)} = \text{clip}\left(\frac{A_{t,(u,v)}^{\text{QG}} - \bar{A}_t^{\text{QG}}}{\max(A_t^{\text{QG}}) - \bar{A}_t^{\text{QG}}}, 0, 1\right), \quad b_{t,(u,v)} = \text{clip}\left(\frac{\bar{A}_t^{\text{QG}} - A_{t,(u,v)}^{\text{QG}}}{\bar{A}_t^{\text{QG}} - \min(A_t^{\text{QG}})}, 0, 1\right)$$
-  $$\mathbf{\Delta Q}_{t, (u,v)} = \kappa_{\max} \cdot \big(1.8 \, b_{t,(u,v)} - 1.0 \, f_{t,(u,v)}\big) \in [-4.0, \, +7.2]\text{ QP}, \quad \text{qoffset} \in [-0.18, \, +0.14]$$
-- **Cơ chế tác động kép:**
-  - Khối chứa vật thể ($A_{t,(u,v)}^{\text{QG}} > \bar{A}_t^{\text{QG}}$) nhận $\mathbf{\Delta Q} \in [-4.0, 0]\text{ QP}$ $\to$ giảm bước lượng tử và giảm hệ số nhân Lagrange $\lambda_{\text{RDO}} = 0.85 \cdot 2^{(\text{QP} + \Delta Q - 12)/3}$ trong `x265`, bảo toàn cấu trúc tần số cao cho cả 2 họ Detector (**Faster R-CNN ResNet50-FPN v2** và **YOLOv8s**).
-  - Khối thuộc vùng nền ($A_{t,(u,v)}^{\text{QG}} < \bar{A}_t^{\text{QG}}$) vừa được làm phẳng ở mức pixel, vừa nhận $\mathbf{\Delta Q} \in [0, +7.2]\text{ QP}$ (`qoffset` tới $+0.14$) trên lưới `16×16` có gộp run-length ngang, cắt giảm tới $\sim 50\%$ bitrate vùng nền.
-  - Hỗ trợ chế độ **IWA-QP (`reuse_iframe_across_gop=True`)**: chỉ tính $\mathbf{\Delta Q}$ tại I-frame và dùng lại cho toàn bộ mini-GOP.
+### 2.3. Điều phối QP khối CTU bất đối xứng (`compute_ctu_qp_offsets`)
 
-### 2.4. Huấn luyện Hybrid Forward-`x265` / Backward-Proxy (Straight-Through Estimator)
-Để xóa bỏ hiện tượng lệch (codec mismatch) giữa bộ mô phỏng và `x265` thật:
-- **Forward Pass:** Nén chuỗi $I_{\text{edit}, 1:T}$ qua `libx265` thật để nhận video giải mã chính xác $\hat{I}_{\text{x265}, t}$ và số bit thực tế $R_{\text{x265}}$.
-- **Backward Pass:** Truyền đạo hàm qua [`DifferentiableVideoProxy`](./video_codecs/hybrid_x265_ste.py) — bộ mô phỏng biến đổi DCT $8\times 8$ có phân biệt mã hóa Intra ($t=0$) và mã hóa phần dư liên khung Inter ($t > 0$, $I_{\text{edit}, t} - \hat{I}_{t-1}$) với bước lượng tử hóa phụ thuộc cả `base_qp` lẫn $\mathbf{\Delta Q}_t$:
+Mượn ý tưởng của WA-RDO nhưng đưa thẳng vào giao diện `x265_picture.quantOffsets` qua FFmpeg `addroi` trên lưới `16×16` vùng (`32×32 px`/ô ở `512×512`) mà không đụng chuẩn bitstream. Bản đồ chú ý $A_t$ sau khi trộn pixel tiếp tục đi qua Average Pooling về lưới nhóm lượng tử `16×16`:
+
+$$A_{t, (u,v)}^{\text{QG}} = \text{AvgPool}_{16\times 16}(A_t)_{(u,v)}$$
+
+Vì người đi bộ trong MOT17 chỉ chiếm khoảng $10\%\text{–}20\%$ khung hình ($\bar{A}_t^{\text{QG}} \approx 0.15$), chuẩn hóa đối xứng zero-mean kiểu cũ chỉ đẩy vùng nền lên tối đa $+2.5\text{ QP}$ (`qoffset` $\le +0.05$). T-SCOPE chuẩn hóa riêng hai phía quanh $\bar{A}_t^{\text{QG}}$:
+
+$$f_{t,(u,v)} = \text{clip}\left(\frac{A_{t,(u,v)}^{\text{QG}} - \bar{A}_t^{\text{QG}}}{\max(A_t^{\text{QG}}) - \bar{A}_t^{\text{QG}}}, 0, 1\right), \quad b_{t,(u,v)} = \text{clip}\left(\frac{\bar{A}_t^{\text{QG}} - A_{t,(u,v)}^{\text{QG}}}{\bar{A}_t^{\text{QG}} - \min(A_t^{\text{QG}})}, 0, 1\right)$$
+
+$$\mathbf{\Delta Q}_{t, (u,v)} = \kappa_{\max} \cdot \big(1.8 \, b_{t,(u,v)} - 1.0 \, f_{t,(u,v)}\big) \in [-4.0, \, +7.2]\text{ QP}, \quad \text{qoffset} \in [-0.18, \, +0.14]$$
+
+Cơ chế này tác động theo hai chiều ngược nhau:
+- Khối có người đi bộ ($A_{t,(u,v)}^{\text{QG}} > \bar{A}_t^{\text{QG}}$) nhận $\mathbf{\Delta Q} \in [-4.0, 0]\text{ QP}$, hạ bước lượng tử và nhân tử Lagrange $\lambda_{\text{RDO}} = 0.85 \cdot 2^{(\text{QP} + \Delta Q - 12)/3}$ trong `x265` để giữ nét biên cho cả **Faster R-CNN ResNet50-FPN v2** lẫn **YOLOv8s**.
+- Khối nền ($A_{t,(u,v)}^{\text{QG}} < \bar{A}_t^{\text{QG}}$) vừa bị làm phẳng pixel vừa nhận $\mathbf{\Delta Q} \in [0, +7.2]\text{ QP}$ (`qoffset` tới $+0.14$) trên lưới `16×16` có gộp run-length ngang, cắt tới khoảng $50\%$ bitrate vùng nền.
+- Khi bật **IWA-QP (`reuse_iframe_across_gop=True`)**, encoder chỉ tính $\mathbf{\Delta Q}$ một lần ở I-frame rồi giữ lại cho cả mini-GOP.
+
+### 2.4. Huấn luyện kết hợp `x265` thật và STE Proxy
+
+Để tránh sai lệch giữa bộ mô phỏng và `x265` thật khi bit xuống thấp:
+- Ở lượt forward, chuỗi $I_{\text{edit}, 1:T}$ chạy qua `libx265` thật để lấy video giải mã $\hat{I}_{\text{x265}, t}$ và dung lượng thực $R_{\text{x265}}$.
+- Ở lượt backward, gradient truyền qua [`DifferentiableVideoProxy`](./video_codecs/hybrid_x265_ste.py) dùng biến đổi DCT $8\times 8$, tách riêng mã hóa Intra ($t=0$) và phần dư liên khung Inter ($t > 0$, $I_{\text{edit}, t} - \hat{I}_{t-1}$) theo bước lượng tử phụ thuộc cả `base_qp` lẫn $\mathbf{\Delta Q}_t$:
   $$\hat{I}_t = \hat{I}_{\text{proxy}, t} + \text{stop\_grad}\big(\hat{I}_{\text{x265}, t} - \hat{I}_{\text{proxy}, t}\big)$$
 
-### 2.5. Hàm Mục tiêu 5 Thành phần Đa Detector (`VCMTemporalPreEditLoss` — Faster R-CNN FPN + YOLOv8s CSPDarknet)
-Chỉ huấn luyện duy nhất mạng `TemporalSCOPE` (**6.11M tham số**), giữ đóng băng hoàn toàn cả hai mạng Detector (**Faster R-CNN ResNet50-FPN v2** двух-stage và **YOLOv8s** one-stage anchor-free):
+### 2.5. Hàm mất mát 5 thành phần đa bộ dò (`VCMTemporalPreEditLoss`)
+
+Quá trình train chỉ cập nhật `TemporalSCOPE` (**6.11M tham số**), giữ đóng băng hoàn toàn hai bộ dò **Faster R-CNN ResNet50-FPN v2** (two-stage) và **YOLOv8s** (one-stage anchor-free):
 
 $$\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{task}} + \mathcal{L}_{\text{att}} + \mathcal{L}_{\text{bg}} + \mathcal{L}_{\text{temp}} + \mathcal{L}_{\text{reg}}$$
 
-1. **Dual-Detector Task Feature Consistency ($\mathcal{L}_{\text{task}}$):** Khoảng cách Smooth-$L_1$ có mặt nạ $M_{\text{det}, t}^\ell$ giữa đặc trưng đa tỷ lệ của ảnh sạch $F_T^\ell(I_t)$ và ảnh sau giải mã $F_S^\ell(\hat{I}_t)$ trên cả 4 tầng FPN `{p2, p3, p4, p5}` của **Faster R-CNN ResNet50-FPN v2** lẫn 3 tầng CSPDarknet `{yolo_p3, yolo_p4, yolo_p5}` của **YOLOv8s**.
-2. **Attention Supervision ($\mathcal{L}_{\text{att}}$):** Tổng của Binary Cross-Entropy, Dice Loss giữa $A_t$ với mặt nạ hộp giới hạn chặt $M_{\text{attn}, t}$, và phạt độ thưa trên vùng nền $\|(1 - M_{\text{det}, t}) \odot A_t\|_1$.
-3. **Spatial Background Simplification & Rate ($\mathcal{L}_{\text{bg}}$):** Làm phẳng độ lệch so với ảnh làm mờ và giảm đạo hàm không gian trong vùng $M_{\text{bg}, t} = 1 - M_{\text{det}, t}$ cộng với ước lượng bitrate $\mathcal{L}_{\text{rate}}$.
-4. **Temporal Inter-Frame Residual Suppression ($\mathcal{L}_{\text{temp}}$ — Đóng góp mới cho Video):**
+1. Sai khác đặc trưng đa bộ dò ($\mathcal{L}_{\text{task}}$): Smooth-$L_1$ có mặt nạ $M_{\text{det}, t}^\ell$ giữa đặc trưng ảnh sạch $F_T^\ell(I_t)$ và ảnh giải mã $F_S^\ell(\hat{I}_t)$ trên 4 tầng FPN `{p2, p3, p4, p5}` (Faster R-CNN ResNet50-FPN v2) cùng 3 tầng CSPDarknet `{yolo_p3, yolo_p4, yolo_p5}` (YOLOv8s).
+2. Giám sát chú ý ($\mathcal{L}_{\text{att}}$): cộng Binary Cross-Entropy và Dice Loss giữa $A_t$ với mặt nạ hộp giới hạn chặt $M_{\text{attn}, t}$, kèm phạt thưa trên vùng nền $\|(1 - M_{\text{det}, t}) \odot A_t\|_1$.
+3. Làm phẳng nền và ước lượng tốc độ bit ($\mathcal{L}_{\text{bg}}$): giữ ảnh nền gần bản làm mờ, giảm gradient không gian trong vùng $M_{\text{bg}, t} = 1 - M_{\text{det}, t}$ và cộng ước lượng bitrate $\mathcal{L}_{\text{rate}}$.
+4. Chống rung liên khung ($\mathcal{L}_{\text{temp}}$):
    $$\mathcal{L}_{\text{temp}} = \lambda_{\text{temp\_bg}} \frac{\big\| M_{\text{bg}, t} M_{\text{bg}, t-1} \odot (I_{\text{edit}, t} - I_{\text{edit}, t-1}) \big\|_1}{\sum M_{\text{bg}, t} M_{\text{bg}, t-1} + \epsilon} + \lambda_{\text{temp\_obj}} \|\Delta_{\text{obj}, t} - \Delta_{\text{obj}, t-1}\|_1$$
-   Trực tiếp ép phần dư dự đoán liên khung ở vùng nền về 0 và làm mượt phần dư vật thể qua các frame liên tiếp.
-5. **Residual Regularization ($\mathcal{L}_{\text{reg}}$):** Phạt chuẩn $L_1$ và Total Variation (TV) lên $\Delta_{\text{obj}, t}, \Delta_{\text{bg}, t}$.
+   Hàm phạt kéo phần dư liên khung vùng nền về 0 và làm mượt phần dư vật thể giữa các frame kế tiếp.
+5. Điều chuẩn phần dư ($\mathcal{L}_{\text{reg}}$): phạt chuẩn $L_1$ và Total Variation (TV) lên $\Delta_{\text{obj}, t}, \Delta_{\text{bg}, t}$.
 
 ---
 
-## 3. Cấu trúc Thư mục Codebase
+## 3. Cấu trúc thư mục mã nguồn
 
 ```text
-├── TCSVT_Paper_Blueprint.md          # Đề cương chi tiết bài báo IEEE TCSVT & bảng biểu thực nghiệm
+├── TCSVT_Paper_Blueprint.md          # Đề cương bài báo IEEE TCSVT và bảng thực nghiệm
 ├── models/
 │   └── temporal_scope.py             # Mạng TemporalSCOPE (6.11M params), FiLM, ConvGRU, CTU Delta-QP
 ├── video_codecs/
@@ -108,19 +116,20 @@ $$\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{task}} + \mathcal{L}_{\text{at
 ├── vcm_datasets/
 │   └── vcm_video_datasets.py         # Bộ nạp dữ liệu thật: MOT17 (gt.txt), SFU-HW-Objects-v1 (.yuv), BDD100K
 ├── scripts/
-│   ├── prepare_kaggle_datasets.py    # Tự động dò /kaggle/input/mot17 & tải nhãn chuẩn MPEG-VCM SFU-HW
-│   ├── kaggle_shard_runner.py        # Worker chạy đánh giá BDBR (Wish-List #2) và huấn luyện theo Shard
+│   ├── prepare_kaggle_datasets.py    # Dò /kaggle/input/mot17 & tải nhãn chuẩn MPEG-VCM SFU-HW
+│   ├── kaggle_shard_runner.py        # Worker chạy đánh giá BDBR và huấn luyện theo Shard
 │   ├── merge_shards.py               # Tính BDBR (%) chuẩn VCEG-M33 & gộp trọng số Model Soup (FedAvg)
-│   └── kaggle_pool_orchestrator.py   # Script điều phối tự động 21 tài khoản Kaggle từ máy cá nhân
-└── train_and_verify.py               # Script kiểm chứng nhanh toàn bộ pipeline Forward/Backward
+│   └── kaggle_pool_orchestrator.py   # Điều phối tự động 21 tài khoản Kaggle từ máy cá nhân
+└── train_and_verify.py               # Script kiểm tra nhanh toàn bộ luồng Forward/Backward
 ```
 
 ---
 
-## 4. Vận hành Cụm 21 Tài khoản Kaggle (>600h GPU `T4 x2` / tuần)
+## 4. Chạy trên cụm 21 tài khoản Kaggle (>600h GPU `T4 x2` / tuần)
 
-### Cách 1: Điều khiển tự động toàn bộ 21 tài khoản từ máy local (`kaggle_pool_orchestrator.py`)
-Không cần mở trình duyệt, chạy trực tiếp trên máy tính cá nhân với file danh sách token `pool.json`:
+### Cách 1: Điều phối từ máy cá nhân (`kaggle_pool_orchestrator.py`)
+
+Chạy thẳng trên máy cá nhân với file token `pool.json`, không cần mở từng tab trình duyệt:
 
 ```powershell
 # 1. Kiểm tra xác thực toàn bộ 21 tài khoản Kaggle
@@ -140,7 +149,8 @@ python -I scripts/merge_shards.py --action soup --manifest "<collection_manifest
 ```
 
 ### Cách 2: Chạy thủ công 1-Cell trên Kaggle Notebook (`GPU T4 x2`)
-Nếu chạy trực tiếp trên giao diện web Kaggle (đã gắn Input Dataset `ahmedsamir1598/mot17challenge`):
+
+Trên web Kaggle, gắn sẵn Input Dataset `ahmedsamir1598/mot17challenge` rồi chạy cell sau:
 
 ```python
 SHARD_ID = 0        # Đổi từ 0 -> 20 tương ứng 21 tài khoản Kaggle
@@ -171,16 +181,17 @@ VARIANT = "full_tscope"  # Hoặc: spatial_only_scope | wo_ctu_delta_qp | iwa_go
 
 ---
 
-## 5. Kết quả Thực nghiệm Đóng gói v1 (`512×512`, `libx265` + `ffprobe` + 1.648 Frame Held-Out)
+## 5. Kết quả thực nghiệm đóng gói v1 (`512×512`, `libx265`, 1.648 frame held-out)
 
-> **Báo cáo đầy đủ:** [`docs/V1_PRELIMINARY_BENCHMARK_REPORT.md`](./docs/V1_PRELIMINARY_BENCHMARK_REPORT.md) | **Dữ liệu gốc hợp lệ (`final_ready=true`, `105/105` JSON):** [`outputs_kaggle_pool/merged_benchmarks.json`](./outputs_kaggle_pool/merged_benchmarks.json)
-> - **Tập kiểm thử:** `1,648` khung hình không chồng lấn (`MOT17-11`: `900` frame `000001..000900`; `MOT17-13`: `748` frame `000001..000748`, loại 2 frame đuôi `749..750`), resize `bilinear_square` `512×512`, `clip_len=4`.
-> - **Giao thức mã hóa & dò:** `ffmpeg -c:v libx265 -preset medium -x265-params aq-mode=2:bframes=0` (`IPPP`, `CRF ∈ {22, 27, 32, 37}`), lưới `addroi` tối đa `16×16` vùng (`qoffset ∈ [-0.18, +0.14]`), bitrate đo từ byte payload video-packet MP4 (`ffprobe -show_packets`), detector `fasterrcnn_resnet50_fpn_v2` và `YOLOv8s` với dataset-level 101-point pedestrian AP.
-> - **5/5 Model Soup kiểm chứng trên `MOT17-09` (`release_ckpts/`):** `full_tscope` (`val_loss=3.141676`), `iwa_gop_qp_reuse` (`3.117673`), `wo_ctu_delta_qp` (`3.136038`), `proxy_only_zhao` (`1.959265`), `spatial_only_scope` (`2.114932`).
+Số liệu gốc nằm tại [`outputs_kaggle_pool/merged_benchmarks.json`](./outputs_kaggle_pool/merged_benchmarks.json) (`final_ready=true`, `105/105` JSON ghép cặp), còn phân tích chi tiết xem thêm ở [`docs/V1_PRELIMINARY_BENCHMARK_REPORT.md`](./docs/V1_PRELIMINARY_BENCHMARK_REPORT.md).
 
-### 5.1. So sánh Tổng thể trên 1.648 Frame Held-Out (`overall_methods_summary`)
+- Bộ test gồm `1,648` khung hình không chồng lấn (`MOT17-11`: `900` frame `000001..000900`; `MOT17-13`: `748` frame `000001..000748`, bỏ 2 frame cuối `749..750`), resize `bilinear_square` về `512×512`, độ dài clip `clip_len=4`.
+- Nén bằng `ffmpeg -c:v libx265 -preset medium -x265-params aq-mode=2:bframes=0` (`IPPP`, `CRF ∈ {22, 27, 32, 37}`), lưới `addroi` tối đa `16×16` vùng (`qoffset ∈ [-0.18, +0.14]`). Bitrate tính từ payload gói video MP4 qua `ffprobe -show_packets`; độ chính xác tính theo dataset-level 101-point pedestrian AP trên `fasterrcnn_resnet50_fpn_v2` và `YOLOv8s`.
+- Cả 5/5 Model Soup trong `release_ckpts/` đã qua kiểm tra trên `MOT17-09` với validation loss lần lượt: `full_tscope` (`val_loss=3.141676`), `iwa_gop_qp_reuse` (`3.117673`), `wo_ctu_delta_qp` (`3.136038`), `proxy_only_zhao` (`1.959265`) và `spatial_only_scope` (`2.114932`).
 
-*(Giá trị BDBR âm = tiết kiệm bitrate ở cùng AP; giá trị dương = tốn thêm bitrate)*
+### 5.1. So sánh tổng thể trên 1.648 frame held-out (`overall_methods_summary`)
+
+*(BDBR âm nghĩa là tiết kiệm bitrate ở cùng AP, dương là tốn thêm bitrate)*
 
 | Phương pháp | Total BDBR (`FRCNN AP50`) | Total BDBR (`FRCNN AP50:95`) | Total BDBR (`YOLO AP50`) | Total BDBR (`YOLO AP50:95`) |
 |---|---:|---:|---:|---:|
@@ -190,7 +201,7 @@ VARIANT = "full_tscope"  # Hoặc: spatial_only_scope | wo_ctu_delta_qp | iwa_go
 | `tscope_temporal_ctu_qp` (`full_tscope`) | `-15.52%` | `-11.52%` | `-13.86%` | `-9.92%` |
 | `oracle_gt_mask_upper_bound` | **`-43.57%`** | **`-44.25%`** | **`-33.74%`** | **`-41.68%`** |
 
-### 5.2. Đường cong từng mức CRF (`1,648` frames) & Ablation 5 Biến thể (`ablation_variants_summary`)
+### 5.2. Đường cong theo từng CRF (`1,648` frames) và ablation 5 biến thể (`ablation_variants_summary`)
 
 | Phương pháp | CRF | Total bpp | I-frame bpp | ROI PSNR (dB) | FRCNN AP50 | FRCNN AP50:95 | YOLO AP50 | YOLO AP50:95 |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -207,9 +218,9 @@ VARIANT = "full_tscope"  # Hoặc: spatial_only_scope | wo_ctu_delta_qp | iwa_go
 | `iwa_gop_qp_reuse` | `3.117673` | `-12.54%` | `-13.85%` | `-15.09%` | `-11.47%` |
 | `proxy_only_zhao` | `1.959265` | `-8.34%` | `-8.79%` | `-6.97%` | `-7.19%` |
 
-Đồ thị đường cong & ablation: [`docs/figures/fig_bdbr_curves.png`](./docs/figures/fig_bdbr_curves.png), [`docs/figures/fig_ablation_bdbr.png`](./docs/figures/fig_ablation_bdbr.png), [`docs/figures/ablation_preedit_comparison_grid.png`](./docs/figures/ablation_preedit_comparison_grid.png).
+Đồ thị R-D, cột ablation và ảnh đối chiếu pre-edit lưu tại [`docs/figures/fig_bdbr_curves.png`](./docs/figures/fig_bdbr_curves.png), [`docs/figures/fig_ablation_bdbr.png`](./docs/figures/fig_ablation_bdbr.png) và [`docs/figures/ablation_preedit_comparison_grid.png`](./docs/figures/ablation_preedit_comparison_grid.png).
 
-### 5.3. Phân rã Theo Chuỗi (`MOT17-11` Camera Cầm tay vs `MOT17-13` Camera Xe buýt Di chuyển Nhanh)
+### 5.3. Phân rã theo từng chuỗi (`MOT17-11` camera cầm tay vs `MOT17-13` camera xe buýt chạy nhanh)
 
 | Sequence (Frames) | Biến thể / Phương pháp | Total FRCNN AP@50 | Total FRCNN AP@50:95 | Total YOLO AP@50 | Total YOLO AP@50:95 |
 |---|---|---:|---:|---:|---:|
@@ -226,18 +237,18 @@ VARIANT = "full_tscope"  # Hoặc: spatial_only_scope | wo_ctu_delta_qp | iwa_go
 | `MOT17-13` (`748`) | `proxy_only_zhao` | `-0.82%` | `-0.33%` | `-0.17%` | `+2.10%` |
 | `MOT17-13` (`748`) | `oracle_gt_mask_upper_bound` | `-52.64%` | `-52.08%` | `-46.33%` | `-45.37%` |
 
-- **Điểm nghẽn v1 trên `MOT17-13`:** Khi camera lia nhanh, hiệu liên khung `I_t - I_{t-1}` chưa bù chuyển động gây ghosting/làm phình `bg_attn`, kéo giảm `ROI PSNR` (`28.33 dB` vs `32.95 dB` ở CRF 22) và làm tăng dư liên khung trên camera di chuyển. Hướng nâng cấp v2 được phát triển riêng tại `wagur1/tscope-v2`.
+Trên `MOT17-13`, hiệu liên khung $I_t - I_{t-1}$ chưa bù chuyển động tạo vệt mờ khi camera lia nhanh và kéo chỉ số `bg_attn` phình lên. Hậu quả là `ROI PSNR` ở CRF 22 giảm từ `32.95 dB` xuống `28.33 dB` còn dư liên khung ở camera chạy nhanh tăng mạnh; phần bù chuyển động cho v2 tách sang repo `wagur1/tscope-v2`.
 
 ---
 
-## 6. Ghi chú Hiệu năng GPU & Tùy chọn Tăng FPS (`512×512`)
+## 6. Đo tốc độ GPU và hướng tối ưu FPS (`512×512`)
 
-Đo thực tế trên **Kaggle Tesla T4** (`commit b824416`, `TemporalSCOPE` `6.11M` tham số, clip `T=4` ở `512×512`):
-- **Inference (`AMP FP16`, `B=1`):** **`19.10 FPS`** (`52.36 ms/frame`, peak VRAM `0.485 GB`).
-- **Inference (`FP32`, `B=1`):** **`5.52 FPS`** (`181.21 ms/frame`, peak VRAM `0.610 GB`).
-- **Training (`B=2, T=4`, FRCNN + YOLOv8s + `libx265` STE):** **`3.219 GB`** peak VRAM (nhờ gradient checkpointing theo chunk FPN và từng bước `T`), tốc độ `3.562 s/step`.
+Các mốc đo bên dưới chạy trên **Kaggle Tesla T4** (`commit b824416`, `TemporalSCOPE` `6.11M` tham số, clip `T=4`, độ phân giải `512×512`):
+- Chạy suy luận `AMP FP16` (`B=1`) đạt **`19.10 FPS`** (`52.36 ms/frame`, VRAM đỉnh `0.485 GB`).
+- Chạy suy luận `FP32` (`B=1`) đạt **`5.52 FPS`** (`181.21 ms/frame`, VRAM đỉnh `0.610 GB`).
+- Lúc train (`B=2, T=4`, kẹp FRCNN + YOLOv8s + `libx265` STE), peak VRAM là **`3.219 GB`** nhờ gradient checkpointing theo chunk FPN và từng bước `T`, tốc độ `3.562 s/step`.
 
-### Tùy chọn tối ưu FPS nếu cần vượt `30–40+ FPS` ngay trên Tesla T4 (không ép ở đợt train hiện tại)
-1. **Thu gọn kênh / lớp ở tầng full-res `512×512`:** Hạ `TemporalSCOPE(base_ch=32)` (thay vì `48`) hoặc chuyển `enc1`/`dec1` sang depthwise-separable conv — giữ nguyên độ phân giải biên `512×512` cho người đi bộ nhỏ & halo `4px` nhưng giảm đáng kể GMACs.
-2. **Dual-resolution `PixelUnshuffle(2)` stem:** Đưa khối UNet chính xuống `H/2` (`256×256`) và giữ 1 nhánh residual nhẹ ở `H×W` để vừa tăng mạnh FPS vừa hạn chế thô ô `2×2` ở viền mask.
-3. **Tối ưu runtime triển khai:** Dùng `torch.compile` hoặc TensorRT FP16 ở pha suy luận (không làm thay đổi kiến trúc hay BD-rate).
+Khi cần đẩy tốc độ lên `30–40+ FPS` ngay trên Tesla T4 (không bật ở cấu hình baseline hiện tại), có thể tinh chỉnh theo 3 hướng:
+1. Hạ số kênh hoặc dùng depthwise-separable conv ở tầng full-res `512×512` (chẳng hạn `TemporalSCOPE(base_ch=32)` thay vì `48`, hoặc sửa `enc1`/`dec1`), vẫn giữ được biên `512×512` cho người đi bộ nhỏ và viền `4px` nhưng giảm đáng kể GMACs.
+2. Đưa khối U-Net chính xuống `H/2` (`256×256`) bằng `PixelUnshuffle(2)` ở đầu vào, chỉ chừa lại một nhánh residual nhẹ trên `H×W` để giữ biên `2×2` đỡ thô.
+3. Chạy `torch.compile` hoặc TensorRT FP16 lúc inference, không đụng tới kiến trúc hay BD-rate.
