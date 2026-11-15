@@ -193,11 +193,9 @@ def render_figures(bundle, output_dir):
     curves = {k: extract_curve(bundle["overall_methods_summary"], k, crfs) for k in METHOD_LABELS}
     panels = [
         ("total_bpp", "gt_ap50", "bdbr_tot_gt50", "Total bitrate (bpp)", "GT AP@50 (%)"),
-        ("p_bpp", "gt_ap50", "bdbr_p_gt50", "P-frame bitrate (bpp)", "GT AP@50 (%)"),
         ("total_bpp", "gt_ap95", "bdbr_tot_gt95", "Total bitrate (bpp)", "GT AP@[.50:.95] (%)"),
-        ("p_bpp", "gt_ap95", "bdbr_p_gt95", "P-frame bitrate (bpp)", "GT AP@[.50:.95] (%)"),
     ]
-    fig, axes = plt.subplots(2, 2, figsize=(12, 9), constrained_layout=True)
+    fig, axes = plt.subplots(1, 2, figsize=(11.5, 5.0), constrained_layout=True)
     for ax, (xf, yf, bf, xl, yl) in zip(axes.flat, panels):
         for idx, (key, label) in enumerate(METHOD_LABELS.items()):
             curve = curves[key]
@@ -208,13 +206,13 @@ def render_figures(bundle, output_dir):
                 for q, x, y in zip(crfs, curve[xf], curve[yf]):
                     ax.annotate(f"CRF {q}", (x, y), xytext=(4, 4), textcoords="offset points", fontsize=7)
         ax.set_xlabel(xl + " (lower is better)")
-        ax.set_ylabel(yl)
+        ax.set_ylabel(yl + " (higher is better)")
         ax.legend(loc="best")
     fig.suptitle("Full-cohort held-out rate-accuracy curves (merged final-ready evidence)\n" + codec_caption(bundle), fontsize=10)
     _save(fig, output_dir, "fig_bdbr_curves", plt)
 
     variants = {k: extract_curve(bundle["ablation_variants_summary"], k, crfs) for k in VARIANT_LABELS}
-    fig, axes = plt.subplots(2, 2, figsize=(13, 10), constrained_layout=True)
+    fig, axes = plt.subplots(1, 2, figsize=(12.5, 5.4), constrained_layout=True)
     for ax, (_, _, bf, xl, yl) in zip(axes.flat, panels):
         unavailable = []
         for idx, (key, label) in enumerate(VARIANT_LABELS.items()):
@@ -231,7 +229,7 @@ def render_figures(bundle, output_dir):
         ax.axhline(0, color="#333333", linewidth=0.8)
         ax.set_xticks(np.arange(len(VARIANT_LABELS)))
         ax.set_xticklabels(list(VARIANT_LABELS.values()), rotation=20, ha="right", fontsize=7)
-        ax.set_ylabel(f"{xl.split(' (')[0]} BDBR at {yl} (%)")
+        ax.set_ylabel(f"{xl.split(' (')[0]} BDBR at {yl} (lower is better)")
         ax.margins(y=0.2)
         if unavailable:
             ax.set_title("Unavailable BDBR\n" + "\n".join(unavailable), fontsize=7)
